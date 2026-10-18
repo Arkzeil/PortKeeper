@@ -72,6 +72,39 @@ static void compatibility_fixtures(void)
     }
 }
 
+static void json_strings(void)
+{
+    pk_row rows[] = {
+        {.port = 3000, .protocol = "TCP", .address = "127.0.0.1:3000",
+         .pid = 123, .command = "quote\" slash\\ control\n\t\001\177\200",
+         .command_available = 1},
+        {.port = 5353, .protocol = "UDP", .address = "[::1]:5353", .pid = 0},
+        {.port = 8080, .protocol = "TCP", .address = "*:8080", .pid = 456}
+    };
+    pk_snapshot snapshot = {.rows = rows, .count = 3};
+    char *output = NULL;
+    size_t size = 0;
+    FILE *stream = open_memstream(&output, &size);
+    CHECK(stream != NULL);
+    CHECK(pk_print_json(stream, &snapshot, 0) == 0);
+    CHECK(fclose(stream) == 0);
+    CHECK(strstr(output, "quote\\\" slash\\\\ control\\u000a\\u0009\\u0001\\u007f\\u0080"));
+    CHECK(strstr(output, "\"pid\":null,\"process\":null"));
+    CHECK(strstr(output, "\"pid\":456,\"process\":null"));
+    CHECK(strstr(output, "command_line") == NULL);
+    CHECK(size == strlen(output) && output[size - 1] == '\n');
+    for (size_t i = 0; i < size - 1; ++i)
+        CHECK((unsigned char)output[i] >= 32 && (unsigned char)output[i] < 127);
+    free(output);
+
+    snapshot = (pk_snapshot){0};
+    stream = open_memstream(&output, &size);
+    CHECK(stream != NULL && pk_print_json(stream, &snapshot, 1) == 0);
+    CHECK(fclose(stream) == 0);
+    CHECK(strcmp(output, "{\"schema_version\":1,\"sockets\":[]}\n") == 0);
+    free(output);
+}
+
 int main(void)
 {
     unsigned port = 0;
@@ -132,6 +165,7 @@ int main(void)
     pk_snapshot_free(&snapshot);
     CHECK(snapshot.rows == NULL && snapshot.count == 0);
     compatibility_fixtures();
+    json_strings();
 
     int sock = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     CHECK(sock >= 0);
@@ -141,8 +175,16 @@ int main(void)
     CHECK(procfd >= 0);
     CHECK(pk_owns_socket(procfd, sock, (uint64_t)st.st_ino) == 0);
     CHECK(pk_owns_socket(procfd, sock, (uint64_t)st.st_ino + 1) < 0 && errno == ESTALE);
+    pk_row own = {.pid = getpid(), .fd = sock, .inode = (uint64_t)st.st_ino};
+    char command[PK_CMDLINE_SIZE];
+    int truncated;
+    CHECK(pk_command_line(&own, command, &truncated) == 0 && !truncated && *command);
+    ++own.inode;
+    CHECK(pk_command_line(&own, command, &truncated) < 0 && errno == ESTALE);
+    --own.inode;
     close(sock);
     CHECK(pk_owns_socket(procfd, sock, (uint64_t)st.st_ino) < 0);
+    CHECK(pk_command_line(&own, command, &truncated) < 0);
     close(procfd);
 
     pk_target target;

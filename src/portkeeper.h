@@ -4,7 +4,10 @@
 #include <signal.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <sys/types.h>
+
+#define PK_CMDLINE_SIZE 4096
 
 enum pk_exit {
     PK_OK = 0, PK_ERROR = 1, PK_USAGE = 2, PK_NOT_FOUND = 3,
@@ -20,6 +23,7 @@ typedef struct {
     pid_t pid;
     int fd;
     char command[256];
+    int command_available;
 } pk_row;
 
 typedef struct {
@@ -44,7 +48,8 @@ int pk_discover(unsigned port, const char *protocol, pk_snapshot *snapshot);
 int pk_proc_open(pid_t pid);
 int pk_owns_socket(int procfd, int fd, uint64_t inode);
 void pk_describe(pk_row *row);
-int pk_command_line(pid_t pid, char *buffer, size_t size);
+int pk_command_line(const pk_row *row, char buffer[PK_CMDLINE_SIZE], int *truncated);
+int pk_print_json(FILE *stream, const pk_snapshot *snapshot, int details);
 int pk_target_open(pid_t pid, pk_target *target);
 int pk_target_signal(const pk_target *target, int signal_number);
 void pk_target_close(pk_target *target);

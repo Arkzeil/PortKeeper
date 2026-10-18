@@ -51,6 +51,7 @@ int pk_owns_socket(int procfd, int fd, uint64_t inode)
 
 void pk_describe(pk_row *row)
 {
+    row->command_available = 0;
     strcpy(row->command, "<unavailable>");
     if (!row->pid)
         return;
@@ -66,6 +67,7 @@ void pk_describe(pk_row *row)
     if (count < 0)
         strcpy(row->command, "<unavailable>");
     else {
+        row->command_available = 1;
         if (count > 0 && row->command[count - 1] == '\n')
             row->command[count - 1] = '\0';
         pk_sanitize(row->command);
@@ -73,17 +75,34 @@ void pk_describe(pk_row *row)
     close(procfd);
 }
 
-int pk_command_line(pid_t pid, char *buffer, size_t size)
+int pk_command_line(const pk_row *row, char buffer[PK_CMDLINE_SIZE], int *truncated)
 {
-    int procfd = pk_proc_open(pid);
+    *truncated = 0;
+    int procfd = pk_proc_open(row->pid);
     if (procfd < 0)
         return -1;
-    ssize_t count = read_proc(procfd, "cmdline", buffer, size);
+    if (pk_owns_socket(procfd, row->fd, row->inode) < 0) {
+        int saved = errno;
+        close(procfd);
+        errno = saved;
+        return -1;
+    }
+    /* Read one extra byte to distinguish an exact fit from truncation. */
+    char raw[PK_CMDLINE_SIZE + 1];
+    ssize_t count = read_proc(procfd, "cmdline", raw, sizeof(raw));
+    if (count >= 0 && pk_owns_socket(procfd, row->fd, row->inode) < 0)
+        count = -1;
     int saved = errno;
     close(procfd);
     errno = saved;
     if (count < 0)
         return -1;
+    if (count >= PK_CMDLINE_SIZE) {
+        *truncated = 1;
+        count = PK_CMDLINE_SIZE - 1;
+    }
+    memcpy(buffer, raw, (size_t)count);
+    buffer[count] = '\0';
     for (ssize_t i = 0; i < count; ++i)
         if (buffer[i] == '\0')
             buffer[i] = ' ';

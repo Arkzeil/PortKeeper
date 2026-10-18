@@ -10,7 +10,7 @@ with Python 3.12.3 and system iproute2 6.1.0.
 | Clang 18.1.3 | Off | Yes | Pass |
 | Clang 18.1.3 | ASan + UBSan | Yes | Pass |
 
-Each configuration passed the unit executable and 27 integration cases. One
+Each configuration passed the unit executable and 34 integration cases. One
 additional integration case requiring root to create a different-UID caller
 was explicitly skipped locally. ASan leak detection and UBSan halt-on-error
 were enabled. No compiler warnings or sanitizer findings remained.
@@ -32,6 +32,17 @@ discarded. The parser now rejects the entire result instead. Unit tests cover
 malformed and overflowing owner fields; an integration test uses a real
 listener and verifies that inspect/stop fail without terminating it.
 
+## JSON output
+
+`list --json` and `inspect --json` were exercised in all four matrix entries.
+Tests decode complete documents using Python's JSON parser, checking field
+types, empty results and exit codes, unavailable owners, protocol filtering,
+shared sockets, escaped process names and arguments, and output-write failures.
+Command-line reads check ownership before and after the read; tests cover a
+stale socket inode and raw capture sizes of 4095, 4096, and 5000 bytes. The
+serializer unit test also covers quotes, backslashes, control bytes, and bytes
+outside printable ASCII.
+
 ## Permission checks
 
 The local tests create their own TCP and UDP listeners and set
@@ -51,7 +62,7 @@ locally**: sudo requires a password and user namespace UID mapping is denied.
 
 The [existing hosted run for starting revision 4b79079](https://github.com/Arkzeil/PortKeeper/actions/runs/39114329724)
 completed successfully in all four GCC/Clang × sanitizer combinations. The
-new fixtures, parser regression, and permission checks were validated locally
+new fixtures, parser regression, permission checks, and JSON support were validated locally
 as described above; they have not been pushed or run in hosted CI yet.
 The workflow now also treats compilation warnings as errors and runs the
 different-UID case in its unsanitized jobs.

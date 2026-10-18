@@ -39,6 +39,11 @@ def holder():
             sock.close()
             print("closed", flush=True)
         signal.signal(signal.SIGTERM, close_on_term)
+    if "PORTKEEPER_TEST_COMM" in os.environ:
+        libc = ctypes.CDLL(None, use_errno=True)
+        name = os.environ["PORTKEEPER_TEST_COMM"].encode("utf-8")
+        if libc.prctl(15, ctypes.c_char_p(name), 0, 0, 0) != 0:  # PR_SET_NAME
+            raise OSError(ctypes.get_errno(), "PR_SET_NAME")
     print(sock.getsockname()[1], flush=True)
     for command in sys.stdin:
         if command.strip() == "close":
@@ -75,15 +80,20 @@ class Integration(unittest.TestCase):
             if stream:
                 stream.close()
 
-    def listener(self, protocol="tcp", family="4", port=0, inherited=None, behavior=None):
+    def listener(self, protocol="tcp", family="4", port=0, inherited=None, behavior=None,
+                 extra_args=(), name=None):
         args = [sys.executable, __file__, "--holder"]
         args += ["inherit", str(inherited)] if inherited is not None else [family, protocol, str(port)]
-        if behavior:
+        if behavior or extra_args:
             self.assertIsNone(inherited)
-            args.append(behavior)
+            args.append(behavior or "")
+        args.extend(extra_args)
+        env = dict(os.environ)
+        if name is not None:
+            env["PORTKEEPER_TEST_COMM"] = name
         process = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE, text=True,
-                                   pass_fds=() if inherited is None else (inherited,))
+                                   pass_fds=() if inherited is None else (inherited,), env=env)
         self.addCleanup(self.cleanup_process, process)
         line = process.stdout.readline()
         self.assertTrue(line, process.stderr.read() if process.poll() is not None else "holder failed")
@@ -178,6 +188,96 @@ class Integration(unittest.TestCase):
         with self.fake_ss("print('tcp LISTEN 0 5 *:12346 *:* ino:9 sk:1')\n") as (env, _):
             self.run_cli("inspect", 12345, env=env, expected=3)
 
+    def test_json_empty_results(self):
+        with self.fake_ss("pass\n") as (env, _):
+            for args, expected in [(("list", "--json"), 0),
+                                   (("inspect", "12345", "--json"), 3)]:
+                result = self.run_cli(*args, expected=expected, env=env)
+                self.assertEqual(json.loads(result.stdout), {"schema_version": 1, "sockets": []})
+                self.assertTrue(result.stdout.endswith("\n"))
+                if expected == 3:
+                    self.assertIn("no matching", result.stderr)
+
+    def test_json_unknown_owners_and_filtering(self):
+        output = ("udp UNCONN 0 0 [::1]:5353 [::]:* ino:12 sk:2\n"
+                  "tcp LISTEN 0 4 127.0.0.1:3000 0.0.0.0:* ino:11 sk:1\n")
+        with self.fake_ss(f"print({output!r})\n") as (env, _):
+            result = self.run_cli("list", "--json", env=env)
+            data = json.loads(result.stdout)
+            self.assertEqual(set(data), {"schema_version", "sockets"})
+            self.assertEqual(data["schema_version"], 1)
+            self.assertEqual(data["sockets"], [
+                {"port": 3000, "protocol": "tcp", "local_address": "127.0.0.1:3000",
+                 "pid": None, "process": None},
+                {"port": 5353, "protocol": "udp", "local_address": "[::1]:5353",
+                 "pid": None, "process": None}])
+            self.assertIn("permissions", result.stderr)
+            result = self.run_cli("list", "--protocol", "udp", "--json", env=env)
+            self.assertEqual(len(json.loads(result.stdout)["sockets"]), 1)
+            result = self.run_cli("inspect", "--json", 3000, env=env)
+            row = json.loads(result.stdout)["sockets"][0]
+            self.assertIsNone(row["command_line"])
+            self.assertIsNone(row["command_line_truncated"])
+
+    def test_json_errors_leave_stdout_empty(self):
+        for args in [("list", "--json", "--json"), ("stop", "3000", "--json"),
+                     ("inspect", "invalid", "--json"), ("--json", "list")]:
+            result = self.run_cli(*args, expected=2)
+            self.assertEqual(result.stdout, "")
+        for body in (None, "print('tcp LISTEN 0 4 *:3000 *:* ino:1 sk:1')\nprint('broken')\n"):
+            with self.fake_ss(body) as (env, _):
+                result = self.run_cli("list", "--json", env=env, expected=4)
+                self.assertEqual(result.stdout, "")
+
+    def test_json_write_failure(self):
+        with self.fake_ss("pass\n") as (env, _), open("/dev/full", "w") as output:
+            result = subprocess.run([BIN, "list", "--json"], stdout=output,
+                                    stderr=subprocess.PIPE, text=True, env=env, timeout=10)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("write JSON output", result.stderr)
+
+    @unittest.skipUnless(SS_AVAILABLE, "iproute2 ss unavailable")
+    def test_json_live_details_and_escaping(self):
+        argument = 'quoted "value" \\ path\n\t\x1b Unicode: \u0394'
+        sanitized = ''.join(chr(b) if 32 <= b < 127 else '?' for b in argument.encode())
+        for protocol in ("tcp", "udp"):
+            with self.subTest(protocol=protocol):
+                process, port = self.listener(protocol, extra_args=(argument,), name='p"k\\test')
+                result = self.run_cli("inspect", port, "--json", "--protocol", protocol)
+                row = json.loads(result.stdout)["sockets"][0]
+                self.assertEqual(row["port"], port)
+                self.assertEqual(row["protocol"], protocol)
+                self.assertIs(type(row["pid"]), int)
+                self.assertEqual(row["pid"], process.pid)
+                self.assertEqual(row["process"], 'p"k\\test')
+                self.assertIn(sanitized, row["command_line"])
+                self.assertIs(row["command_line_truncated"], False)
+                result = self.run_cli("list", "--json", "--protocol", protocol)
+                rows = [r for r in json.loads(result.stdout)["sockets"] if r["pid"] == process.pid]
+                self.assertEqual(len(rows), 1)
+                self.assertNotIn("command_line", rows[0])
+
+    @unittest.skipUnless(SS_AVAILABLE, "iproute2 ss unavailable")
+    def test_json_process_name_is_not_availability_marker(self):
+        process, port = self.listener(name="<unavailable>")
+        result = self.run_cli("inspect", port, "--json", "--protocol", "tcp")
+        row = json.loads(result.stdout)["sockets"][0]
+        self.assertEqual(row["pid"], process.pid)
+        self.assertEqual(row["process"], "<unavailable>")
+
+    @unittest.skipUnless(SS_AVAILABLE, "iproute2 ss unavailable")
+    def test_json_command_line_size_boundary(self):
+        prefix = [sys.executable, __file__, "--holder", "4", "tcp", "0", ""]
+        prefix_size = sum(len(os.fsencode(arg)) + 1 for arg in prefix)
+        for raw_size in (4095, 4096, 5000):
+            with self.subTest(raw_size=raw_size):
+                payload = "x" * (raw_size - prefix_size - 1)
+                process, port = self.listener(extra_args=(payload,))
+                result = self.run_cli("inspect", port, "--json", "--protocol", "tcp")
+                row = json.loads(result.stdout)["sockets"][0]
+                self.assertEqual(row["pid"], process.pid)
+                self.assertIs(row["command_line_truncated"], raw_size > 4095)
+                self.assertLessEqual(len(row["command_line"]), 4095)
 
     def test_exec_arguments(self):
         with self.fake_ss("import json, sys\nprint(json.dumps(sys.argv), file=sys.stderr)\n") as (env, _):
@@ -395,6 +495,10 @@ class Integration(unittest.TestCase):
         result = self.run_cli("inspect", port)
         self.assertIn(str(first.pid), result.stdout)
         self.assertIn(str(second.pid), result.stdout)
+        result = self.run_cli("inspect", port, "--json", "--protocol", "tcp")
+        rows = json.loads(result.stdout)["sockets"]
+        self.assertEqual({r["pid"] for r in rows}, {first.pid, second.pid})
+        self.assertEqual(len(rows), 2)
         result = self.run_cli("stop", port, "--wait", "3s", input="yes\n")
         self.assertIn("Processes: 2/2 exited.", result.stdout)
         self.assertIn("no matching listening sockets", result.stdout)
@@ -427,6 +531,10 @@ class Integration(unittest.TestCase):
                 result = self.run_cli("inspect", port, "--protocol", protocol)
                 self.assertIn("<unavailable>", result.stdout)
                 self.assertIn("permissions", result.stderr)
+                result = self.run_cli("inspect", port, "--json", "--protocol", protocol)
+                row = json.loads(result.stdout)["sockets"][0]
+                for field in ("pid", "process", "command_line", "command_line_truncated"):
+                    self.assertIsNone(row[field])
                 for extra in ((), ("--dry-run",), ("--wait", "100ms")):
                     result = self.run_cli("stop", port, "--protocol", protocol, *extra,
                                           input="yes\n", expected=5)

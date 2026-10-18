@@ -33,6 +33,8 @@ portkeeper list
 portkeeper list --protocol tcp
 portkeeper inspect 8080
 portkeeper inspect 5353 --protocol udp
+portkeeper list --json
+portkeeper inspect 8080 --json
 portkeeper stop 8080 --dry-run
 portkeeper stop 8080
 portkeeper stop 8080 --wait 3s
@@ -64,6 +66,63 @@ and other answers cancel. `--dry-run` validates the visible targets without
 requesting confirmation or delivering a termination signal. There is no implicit
 confirmation or force option. **Terminating a process affects all its sockets
 and other work, including sockets on ports you did not select.**
+
+### JSON output
+
+`list --json` and `inspect PORT --json` write one JSON document followed by a
+newline. `--protocol` works with either command. Diagnostics and visibility
+warnings go to stderr; stdout contains no table, prompt, or warning text.
+
+For example, `portkeeper inspect 8080 --json` can return:
+
+```json
+{
+  "schema_version": 1,
+  "sockets": [
+    {
+      "port": 8080,
+      "protocol": "tcp",
+      "local_address": "127.0.0.1:8080",
+      "pid": 4012,
+      "process": "python3",
+      "command_line": "python3 server.py",
+      "command_line_truncated": false
+    }
+  ]
+}
+```
+
+Version 1 has these fields. Consumers should select fields by name and tolerate
+additional fields in future compatible releases; object key order and formatting
+are not part of the interface.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `schema_version` | integer | Output schema version, currently `1` |
+| `sockets` | array | Socket/visible-owner rows, in the same order as the table |
+| `sockets[].port` | integer | Local port, 1–65535 |
+| `sockets[].protocol` | string | `tcp` or `udp` |
+| `sockets[].local_address` | string | Local endpoint including port and any IPv6 brackets/interface scope |
+| `sockets[].pid` | integer or null | Verified owner PID, or null if unavailable |
+| `sockets[].process` | string or null | Process name, or null if unavailable |
+| `sockets[].command_line` | string or null | Inspect only: best-effort command line, or null if unavailable |
+| `sockets[].command_line_truncated` | boolean or null | Inspect only: whether raw command-line data exceeded the 4095-byte capture limit; null if unavailable |
+
+`list` omits both command-line fields and does not read process arguments.
+`inspect` includes them on every row. Reading command-line details checks the
+discovered socket ownership before and after the read; a process exit, changed
+descriptor, or denied read yields null details. Names, arguments, and addresses
+follow the existing ASCII sanitization policy, with JSON quotes and backslashes
+escaped. NUL argument separators become spaces and trailing spaces are removed;
+the result is a display string, not an argument array or a shell command.
+
+Empty results use `{"schema_version":1,"sockets":[]}`. An empty `list --json`
+succeeds; an unmatched `inspect --json` still returns exit code `3` and writes
+the no-match diagnostic to stderr. Argument and discovery failures write no JSON
+to stdout and retain the existing exit codes. Output failures can leave a partial
+document and return an I/O error. Scripts should check the exit status before
+using the document. Shared sockets can have multiple rows, one per visible owner.
+`stop --json` is unsupported and returns usage error `2`.
 
 ### Verify a stop
 
@@ -192,13 +251,17 @@ unsanitized CI jobs with sudo and explicitly skips during ordinary local runs.
 Malformed PID/descriptor claims reject the complete socket result, including
 when another owner in that result is valid.
 
+JSON tests parse output using Python's JSON decoder and cover null owners,
+empty results, field types, protocol filtering, shared sockets, escaped names
+and arguments, exact command-line capture boundaries, and stdout write failures.
+
 GitHub Actions builds and tests GCC and Clang, with and without combined ASan /
 UBSan, and treats compilation warnings as errors. Actual numeric PID
 wraparound/reuse is not forced by the tests; stable PID descriptors address
 that race. See [the compatibility validation record](VALIDATION.md) for compiler
 versions, fixture provenance, results, and remaining verification limits.
 
-The first draft intentionally has no JSON output, watch mode, process-tree
+The first draft intentionally has no watch mode, process-tree
 termination, SIGKILL escalation, service management, remote queries, or port
 reservation. `ss` supplies socket discovery; Portkeeper does not implement a
 replacement network scanner or a complete `lsof`/`ss` feature set.

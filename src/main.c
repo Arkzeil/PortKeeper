@@ -11,12 +11,13 @@
 static void usage(FILE *stream)
 {
     fputs("Usage:\n"
-          "  portkeeper list [--protocol tcp|udp]\n"
-          "  portkeeper inspect PORT [--protocol tcp|udp]\n"
+          "  portkeeper list [--protocol tcp|udp] [--json]\n"
+          "  portkeeper inspect PORT [--protocol tcp|udp] [--json]\n"
           "  portkeeper stop PORT [--protocol tcp|udp] [--dry-run] [--wait DURATION]\n"
           "  portkeeper --help | --version\n\n"
           "PORT is a decimal number from 1 to 65535. stop sends SIGTERM to\n"
           "all visible owners after you type 'yes'. --dry-run sends no signals.\n"
+          "--json writes a versioned JSON document for list/inspect.\n"
           "--wait verifies exit and rechecks sockets. DURATION is a positive whole\n"
           "number of seconds (3 or 3s) or milliseconds (250ms), at most 3600s.\n",
           stream);
@@ -27,10 +28,20 @@ static void interrupted(int signal_number)
     pk_interrupted = signal_number;
 }
 
+static void warn_unavailable(const pk_snapshot *snapshot)
+{
+    for (size_t i = 0; i < snapshot->count; ++i) {
+        if (!snapshot->rows[i].pid) {
+            fputs("portkeeper: some owners are unavailable (permissions or a process exited); "
+                  "run with appropriate privileges for more visibility\n", stderr);
+            break;
+        }
+    }
+}
+
 static void print_snapshot(const pk_snapshot *snapshot, int details)
 {
     puts("PORT   PROTOCOL PID     PROCESS              LOCAL ADDRESS");
-    int unavailable = 0;
     for (size_t i = 0; i < snapshot->count; ++i) {
         const pk_row *row = &snapshot->rows[i];
         char pid[32];
@@ -38,22 +49,20 @@ static void print_snapshot(const pk_snapshot *snapshot, int details)
             snprintf(pid, sizeof(pid), "%ld", (long)row->pid);
         else {
             strcpy(pid, "-");
-            unavailable = 1;
         }
         printf("%-6u %-8s %-7s %-20s %s\n", row->port, row->protocol,
                pid, row->command, row->address);
         if (details && row->pid) {
-            char command[4096];
-            if (pk_command_line(row->pid, command, sizeof(command)) == 0)
+            char command[PK_CMDLINE_SIZE];
+            int truncated;
+            if (pk_command_line(row, command, &truncated) == 0)
                 printf("  Command: %s%s\n", *command ? command : "<empty>",
-                       strlen(command) == sizeof(command) - 1 ? " [truncated]" : "");
+                       truncated ? " [truncated]" : "");
             else
                 printf("  Command: <unavailable: %s>\n", strerror(errno));
         }
     }
-    if (unavailable)
-        fputs("portkeeper: some owners are unavailable (permissions or a process exited); "
-              "run with appropriate privileges for more visibility\n", stderr);
+    warn_unavailable(snapshot);
 }
 
 static int target_error(pid_t pid, const char *operation)
@@ -341,6 +350,7 @@ int main(int argc, char **argv)
     const char *protocol = NULL;
     int dry_run = 0;
     int wait_ms = 0;
+    int json = 0;
     for (int i = 2; i < argc; ++i) {
         if (strcmp(argv[i], "--protocol") == 0 && !protocol && i + 1 < argc) {
             const char *value = argv[++i];
@@ -355,6 +365,8 @@ int main(int argc, char **argv)
         } else if (strcmp(argv[i], "--wait") == 0 && is_stop && !wait_ms && i + 1 < argc) {
             if (pk_wait_ms(argv[++i], &wait_ms) < 0)
                 goto invalid;
+        } else if (strcmp(argv[i], "--json") == 0 && !is_stop && !json) {
+            json = 1;
         } else if (!is_list && !port && pk_port(argv[i], &port) == 0) {
             /* Strict numeric conversion; no shell or ss expression input. */
         } else {
@@ -382,12 +394,21 @@ int main(int argc, char **argv)
     }
     pk_snapshot snapshot = {0};
     int result = pk_discover(port, protocol, &snapshot);
+    if (result == PK_OK && json) {
+        if (pk_print_json(stdout, &snapshot, !is_list) < 0 || fflush(stdout) == EOF) {
+            perror("portkeeper: write JSON output");
+            result = PK_ERROR;
+        } else {
+            warn_unavailable(&snapshot);
+        }
+    }
     if (result == PK_OK) {
         if (!snapshot.count && !is_list) {
             fprintf(stderr, "portkeeper: no matching listening sockets on port %u\n", port);
             result = PK_NOT_FOUND;
         } else {
-            print_snapshot(&snapshot, !is_list && !is_stop);
+            if (!json)
+                print_snapshot(&snapshot, !is_list && !is_stop);
             /* Output must succeed before asking to perform a destructive action. */
             if (fflush(stdout) == EOF) {
                 perror("portkeeper: write output");
