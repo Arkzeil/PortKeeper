@@ -1,0 +1,54 @@
+Implement a small, production-quality Linux CLI utility in C17.
+
+Project: [Portkeeper, a local port manager]
+
+Purpose:
+MVP 功能： 列出 TCP/UDP listening ports、對應 PID、process command，支援指定 port 查詢，以及經使用者確認後終止程序。
+針對 Linux 實作 /proc 或 ss 的資訊收集，處理程序退出、PID 重用及權限不足問題，並提供清楚的錯誤訊息。
+Do not reinvent wheel： 不重新開發 lsof 或 ss。第一版可以直接呼叫系統工具，只提供更方便的查詢與操作介面。
+
+example output:
+```bash
+$ portkeeper list
+
+PORT    PROTOCOL    PID     PROCESS
+3000    TCP         1823    node
+5000    TCP         2741    python
+8080    TCP         4012    nginx
+
+$ portkeeper inspect 8080
+$ portkeeper stop 8080
+```
+
+Requirements:
+- Target Linux with GCC and Clang.
+- Keep the implementation focused, ideally 500–3,000 lines of application C code.
+- Use CMake for building.
+- Prefer existing mature libraries and system utilities instead of reimplementing functionality.
+- Keep dependencies minimal.
+- No GUI, web frontend, or unnecessary frameworks.
+- Implement robust error handling and meaningful exit codes.
+- Handle malformed input, missing files, permission errors, and interrupted operations.
+- Never construct shell commands using untrusted arguments.
+- Use fork/exec or posix_spawn with argument arrays when executing external programs.
+- Use dry-run mode for potentially destructive operations.
+
+Quality requirements:
+- Compile with -Wall -Wextra -Wpedantic.
+- Include automated unit and integration tests.
+- Provide ASan and UBSan build options.
+- Run tests and fix failures.
+- Include a README with installation and usage examples.
+- Add GitHub Actions CI for GCC and Clang.
+- Avoid unnecessary abstractions or overengineering.
+
+Workflow:
+1. Inspect existing tools and libraries that already solve related problems.
+2. Define a minimal architecture and scope.
+3. Implement the complete MVP.
+4. Build and execute the test suite.
+5. Address compiler warnings and sanitizer findings.
+6. Review edge cases and security risks.
+7. Document what is implemented and what is intentionally unsupported.
+
+Make reasonable implementation decisions independently. Do not stop after producing a skeleton or a plan. Complete the working implementation and report any unverified behavior.
