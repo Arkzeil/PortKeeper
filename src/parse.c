@@ -31,6 +31,25 @@ int pk_port(const char *text, unsigned *port)
     return 0;
 }
 
+int pk_wait_ms(const char *text, int *milliseconds)
+{
+    uint64_t value;
+    const char *end;
+    if (number(text, &end, &value) < 0 || value == 0)
+        return -1;
+    unsigned multiplier;
+    if (!*end || strcmp(end, "s") == 0)
+        multiplier = 1000;
+    else if (strcmp(end, "ms") == 0)
+        multiplier = 1;
+    else
+        return -1;
+    if (value > 3600000 / multiplier)
+        return -1;
+    *milliseconds = (int)(value * multiplier);
+    return 0;
+}
+
 void pk_sanitize(char *text)
 {
     for (unsigned char *p = (unsigned char *)text; *p; ++p)

@@ -32,6 +32,18 @@ int main(void)
                          "80;id", "80/tcp", "9999999999999999999999999999"};
     for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); ++i)
         CHECK(pk_port(bad[i], &port) < 0);
+    int milliseconds;
+    CHECK(pk_wait_ms("3", &milliseconds) == 0 && milliseconds == 3000);
+    CHECK(pk_wait_ms("3s", &milliseconds) == 0 && milliseconds == 3000);
+    CHECK(pk_wait_ms("250ms", &milliseconds) == 0 && milliseconds == 250);
+    CHECK(pk_wait_ms("1ms", &milliseconds) == 0 && milliseconds == 1);
+    CHECK(pk_wait_ms("3600s", &milliseconds) == 0 && milliseconds == 3600000);
+    CHECK(pk_wait_ms("3600000ms", &milliseconds) == 0 && milliseconds == 3600000);
+    const char *bad_wait[] = {"", "0", "0ms", "-1", "+1s", "1.5s", "1m", "s",
+                             "1 s", " 1s", "1s ", "1MS", "3601s", "3600001ms",
+                             "999999999999999999999999999", "18446744073709551615s"};
+    for (size_t i = 0; i < sizeof(bad_wait) / sizeof(bad_wait[0]); ++i)
+        CHECK(pk_wait_ms(bad_wait[i], &milliseconds) < 0);
     char dirty[] = "hi\033[31m\t\n\377";
     pk_sanitize(dirty);
     CHECK(strcmp(dirty, "hi?[31m???") == 0);

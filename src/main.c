@@ -1,9 +1,11 @@
 #include "portkeeper.h"
 
 #include <errno.h>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 static void usage(FILE *stream)
@@ -11,10 +13,12 @@ static void usage(FILE *stream)
     fputs("Usage:\n"
           "  portkeeper list [--protocol tcp|udp]\n"
           "  portkeeper inspect PORT [--protocol tcp|udp]\n"
-          "  portkeeper stop PORT [--protocol tcp|udp] [--dry-run]\n"
+          "  portkeeper stop PORT [--protocol tcp|udp] [--dry-run] [--wait DURATION]\n"
           "  portkeeper --help | --version\n\n"
           "PORT is a decimal number from 1 to 65535. stop sends SIGTERM to\n"
-          "all visible owners after you type 'yes'. --dry-run sends no signals.\n",
+          "all visible owners after you type 'yes'. --dry-run sends no signals.\n"
+          "--wait verifies exit and rechecks sockets. DURATION is a positive whole\n"
+          "number of seconds (3 or 3s) or milliseconds (250ms), at most 3600s.\n",
           stream);
 }
 
@@ -108,8 +112,119 @@ static int same_snapshot(const pk_snapshot *a, const pk_snapshot *b)
     return 1;
 }
 
+static int64_t monotonic_ms(void)
+{
+    struct timespec time;
+    if (clock_gettime(CLOCK_MONOTONIC, &time) < 0)
+        return -1;
+    return (int64_t)time.tv_sec * 1000 + time.tv_nsec / 1000000;
+}
+
+static int wait_for_exit(const pk_target *targets, size_t count, int wait_ms)
+{
+    struct pollfd *descriptors = calloc(count, sizeof(*descriptors));
+    if (!descriptors) {
+        perror("portkeeper: allocate exit monitors");
+        return PK_ERROR;
+    }
+    for (size_t i = 0; i < count; ++i)
+        descriptors[i] = (struct pollfd){.fd = targets[i].pidfd, .events = POLLIN};
+    int result = PK_OK;
+    int64_t started = monotonic_ms();
+    if (started < 0) {
+        perror("portkeeper: read monotonic clock");
+        result = PK_ERROR;
+        goto done;
+    }
+    printf("Waiting up to %d ms for %zu process(es) to exit.\n", wait_ms, count);
+    if (fflush(stdout) == EOF) {
+        perror("portkeeper: write wait status (SIGTERM already sent)");
+        result = PK_ERROR;
+        goto done;
+    }
+    size_t remaining = count;
+    while (remaining) {
+        if (pk_interrupted) {
+            result = 128 + pk_interrupted;
+            goto done;
+        }
+        int64_t current = monotonic_ms();
+        if (current < 0) {
+            perror("portkeeper: read monotonic clock");
+            result = PK_ERROR;
+            goto done;
+        }
+        int64_t left = started + wait_ms - current;
+        /* Short polls also cover a signal arriving between the flag check
+         * and poll. The deadline is shared by all targets, not per PID. */
+        int timeout = left <= 0 ? 0 : left > 100 ? 100 : (int)left;
+        int ready = poll(descriptors, (nfds_t)count, timeout);
+        if (ready < 0) {
+            if (errno == EINTR)
+                continue;
+            perror("portkeeper: poll process exits");
+            result = PK_ERROR;
+            goto done;
+        }
+        for (size_t i = 0; i < count; ++i) {
+            if (descriptors[i].revents & (POLLERR | POLLNVAL)) {
+                fprintf(stderr, "portkeeper: cannot monitor PID %ld for exit\n",
+                        (long)targets[i].pid);
+                result = PK_ERROR;
+                goto done;
+            }
+            /* pidfds become readable on exit, including unreaped zombies. */
+            if (descriptors[i].revents & (POLLIN | POLLHUP)) {
+                printf("PID %ld exited.\n", (long)targets[i].pid);
+                descriptors[i].fd = -1;
+                --remaining;
+            }
+        }
+        if (left <= 0)
+            break;
+    }
+    printf("Processes: %zu/%zu exited.\n", count - remaining, count);
+    if (remaining) {
+        for (size_t i = 0; i < count; ++i)
+            if (descriptors[i].fd >= 0)
+                printf("PID %ld still running at the %d ms deadline.\n",
+                       (long)targets[i].pid, wait_ms);
+        result = PK_TIMEOUT;
+    }
+done:
+    free(descriptors);
+    return pk_interrupted ? 128 + pk_interrupted : result;
+}
+
+static int verify_stop_outcome(unsigned port, const char *protocol,
+                               const pk_target *targets, size_t count, int wait_ms)
+{
+    int result = wait_for_exit(targets, count, wait_ms);
+    if (result != PK_OK && result != PK_TIMEOUT)
+        return result;
+    pk_snapshot current = {0};
+    int discovered = pk_discover(port, protocol, &current);
+    if (discovered != PK_OK) {
+        fputs("portkeeper: socket state could not be verified; SIGTERM was already sent\n",
+              stderr);
+        pk_snapshot_free(&current);
+        return discovered;
+    }
+    const char *scope = protocol ? protocol : "TCP/UDP";
+    if (current.count) {
+        printf("Port %u: matching listening sockets remain (%s).\n", port, scope);
+        print_snapshot(&current, 0);
+        if (result == PK_OK)
+            result = PK_OCCUPIED;
+    } else {
+        printf("Port %u: no matching listening sockets (%s) at verification.\n", port, scope);
+    }
+    pk_snapshot_free(&current);
+    return result;
+}
+
 static int stop_port(unsigned port, const char *protocol, const pk_snapshot *snapshot,
-                     int dry_run)
+                     int dry_run, int wait_ms)
 {
     pk_target *targets = calloc(snapshot->count, sizeof(*targets));
     if (!targets) {
@@ -141,7 +256,7 @@ static int stop_port(unsigned port, const char *protocol, const pk_snapshot *sna
         printf("Dry run: would send SIGTERM to %zu process(es). No signals sent.\n", count);
         goto done;
     }
-    printf("SIGTERM will terminate %zu process(es), affecting ALL their ports and work.\n"
+    printf("SIGTERM will be sent to %zu process(es), affecting ALL their ports and work.\n"
            "Type 'yes' to continue: ", count);
     if (fflush(stdout) == EOF) {
         perror("portkeeper: write output");
@@ -177,6 +292,7 @@ static int stop_port(unsigned port, const char *protocol, const pk_snapshot *sna
     result = verify_ownership(snapshot, targets, count);
     if (result != PK_OK)
         goto done;
+    size_t sent = 0;
     for (size_t i = 0; i < count; ++i) {
         if (pk_interrupted) {
             result = 128 + pk_interrupted;
@@ -188,6 +304,14 @@ static int stop_port(unsigned port, const char *protocol, const pk_snapshot *sna
             break;
         }
         printf("Sent SIGTERM to PID %ld.\n", (long)targets[i].pid);
+        ++sent;
+    }
+    if (wait_ms && sent && !pk_interrupted) {
+        int outcome = verify_stop_outcome(port, protocol, targets, sent, wait_ms);
+        /* A delivery failure takes precedence over verification of the subset
+         * that received SIGTERM. Never send signals to newly discovered owners. */
+        if (result == PK_OK)
+            result = outcome;
     }
 done:
     for (size_t i = 0; i < count; ++i)
@@ -216,6 +340,7 @@ int main(int argc, char **argv)
     unsigned port = 0;
     const char *protocol = NULL;
     int dry_run = 0;
+    int wait_ms = 0;
     for (int i = 2; i < argc; ++i) {
         if (strcmp(argv[i], "--protocol") == 0 && !protocol && i + 1 < argc) {
             const char *value = argv[++i];
@@ -227,6 +352,9 @@ int main(int argc, char **argv)
                 goto invalid;
         } else if (strcmp(argv[i], "--dry-run") == 0 && is_stop && !dry_run) {
             dry_run = 1;
+        } else if (strcmp(argv[i], "--wait") == 0 && is_stop && !wait_ms && i + 1 < argc) {
+            if (pk_wait_ms(argv[++i], &wait_ms) < 0)
+                goto invalid;
         } else if (!is_list && !port && pk_port(argv[i], &port) == 0) {
             /* Strict numeric conversion; no shell or ss expression input. */
         } else {
@@ -265,7 +393,7 @@ int main(int argc, char **argv)
                 perror("portkeeper: write output");
                 result = PK_ERROR;
             } else if (is_stop) {
-                result = stop_port(port, protocol, &snapshot, dry_run);
+                result = stop_port(port, protocol, &snapshot, dry_run, wait_ms);
             }
         }
     }

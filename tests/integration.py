@@ -26,6 +26,14 @@ def holder():
         sock.bind(("::1" if family == socket.AF_INET6 else "127.0.0.1", int(sys.argv[4])))
         if kind == socket.SOCK_STREAM:
             sock.listen(4)
+    behavior = sys.argv[5] if len(sys.argv) > 5 else None
+    if behavior == "ignore":
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    elif behavior == "close":
+        def close_on_term(_signum, _frame):
+            sock.close()
+            print("closed", flush=True)
+        signal.signal(signal.SIGTERM, close_on_term)
     print(sock.getsockname()[1], flush=True)
     for command in sys.stdin:
         if command.strip() == "close":
@@ -50,6 +58,8 @@ class Integration(unittest.TestCase):
 
     def cleanup_process(self, process):
         if process.poll() is None:
+            if process.stdin and not process.stdin.closed:
+                process.stdin.close()
             process.terminate()
             try:
                 process.wait(timeout=3)
@@ -60,9 +70,12 @@ class Integration(unittest.TestCase):
             if stream:
                 stream.close()
 
-    def listener(self, protocol="tcp", family="4", port=0, inherited=None):
+    def listener(self, protocol="tcp", family="4", port=0, inherited=None, behavior=None):
         args = [sys.executable, __file__, "--holder"]
         args += ["inherit", str(inherited)] if inherited is not None else [family, protocol, str(port)]
+        if behavior:
+            self.assertIsNone(inherited)
+            args.append(behavior)
         process = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE, text=True,
                                    pass_fds=() if inherited is None else (inherited,))
@@ -75,11 +88,15 @@ class Integration(unittest.TestCase):
         process = subprocess.Popen([BIN, "stop", str(port), *extra], stdin=subprocess.PIPE,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.addCleanup(self.cleanup_process, process)
+        self.read_until(process, b"Type 'yes'")
+        return process
+
+    def read_until(self, process, marker):
         output = b""
         with selectors.DefaultSelector() as selector:
             selector.register(process.stdout, selectors.EVENT_READ)
             deadline = time.monotonic() + 8
-            while b"Type 'yes'" not in output:
+            while marker not in output:
                 self.assertLess(time.monotonic(), deadline, output.decode(errors="replace"))
                 if not selector.select(timeout=0.2):
                     continue
@@ -87,7 +104,7 @@ class Integration(unittest.TestCase):
                 if not chunk:
                     self.fail(output.decode(errors="replace") + process.stderr.read().decode())
                 output += chunk
-        return process
+        return output
 
     @contextlib.contextmanager
     def fake_ss(self, body=None):
@@ -105,6 +122,11 @@ class Integration(unittest.TestCase):
                      ["list", "--dry-run"], ["stop", "80", "--yes"],
                      ["list", "--protocol", "sctp"], ["stop", "80", "81"],
                      ["inspect", "--protocol"], ["list", "--protocol", "tcp", "--protocol", "udp"]]:
+            self.run_cli(*args, expected=2)
+        for args in [["list", "--wait", "3s"], ["inspect", "80", "--wait", "3s"],
+                     ["stop", "80", "--wait"], ["stop", "80", "--wait", "0"],
+                     ["stop", "80", "--wait", "1.5s"],
+                     ["stop", "80", "--wait", "1s", "--wait", "2s"]]:
             self.run_cli(*args, expected=2)
         for port in ["0", "65536", "-1", "+80", "80;touch /tmp/should-not-exist",
                      "80\n", "", "999999999999999999999999999"]:
@@ -194,12 +216,101 @@ class Integration(unittest.TestCase):
         self.run_cli("stop", port, "--protocol", "udp", input="yes\n")
         self.assertEqual(process.wait(timeout=3), -signal.SIGTERM)
 
+    @unittest.skipUnless(SS_AVAILABLE, "iproute2 ss unavailable")
+    def test_wait_exit_and_socket_release(self):
+        for protocol, duration in [("tcp", "3s"), ("udp", "3")]:
+            with self.subTest(protocol=protocol):
+                process, port = self.listener(protocol)
+                result = self.run_cli("stop", port, "--wait", duration, input="yes\n")
+                # The parent has not waited/reaped the holder yet: pidfd
+                # readability must count a zombie as exited, not still alive.
+                self.assertIn(f"PID {process.pid} exited.", result.stdout)
+                self.assertIn("Processes: 1/1 exited.", result.stdout)
+                self.assertIn("no matching listening sockets", result.stdout)
+                self.assertEqual(process.wait(timeout=3), -signal.SIGTERM)
+
+    @unittest.skipUnless(SS_AVAILABLE, "iproute2 ss unavailable")
+    def test_wait_timeout_while_still_listening(self):
+        process, port = self.listener(behavior="ignore")
+        started = time.monotonic()
+        result = self.run_cli("stop", port, "--wait", "150ms", input="yes\n", expected=8)
+        self.assertGreaterEqual(time.monotonic() - started, 0.14)
+        self.assertLess(time.monotonic() - started, 4)
+        self.assertIn("Processes: 0/1 exited.", result.stdout)
+        self.assertIn(f"PID {process.pid} still running", result.stdout)
+        self.assertIn("matching listening sockets remain", result.stdout)
+        self.assertIsNone(process.poll())
+
+    @unittest.skipUnless(SS_AVAILABLE, "iproute2 ss unavailable")
+    def test_wait_timeout_after_socket_release(self):
+        process, port = self.listener(behavior="close")
+        result = self.run_cli("stop", port, "--wait", "150ms", input="yes\n", expected=8)
+        self.assertIn("still running", result.stdout)
+        self.assertIn("no matching listening sockets", result.stdout)
+        self.assertIsNone(process.poll())
+
+    @unittest.skipUnless(SS_AVAILABLE, "iproute2 ss unavailable")
+    def test_wait_reports_replacement_without_signaling_it(self):
+        process, port = self.listener(behavior="close")
+        stopping = self.pending_stop(port, "--wait", "3s")
+        stopping.stdin.write(b"yes\n")
+        stopping.stdin.flush()
+        self.read_until(process, b"closed")
+        # Rebind after SIGTERM, before the original target exits. This models
+        # a service replacing its listener while shutdown is still underway.
+        replacement, _ = self.listener(port=port)
+        process.stdin.close()
+        stdout, stderr = stopping.communicate(timeout=8)
+        self.assertEqual(stopping.returncode, 9, stdout + stderr)
+        self.assertIn(f"PID {process.pid} exited.".encode(), stdout)
+        self.assertIn("matching listening sockets remain", stdout.decode())
+        self.assertIn(str(replacement.pid).encode(), stdout)
+        self.assertIsNone(replacement.poll())
+
+    @unittest.skipUnless(SS_AVAILABLE, "iproute2 ss unavailable")
+    def test_wait_dry_run_does_not_signal_or_wait(self):
+        process, port = self.listener(behavior="ignore")
+        result = self.run_cli("stop", port, "--wait", "3600s", "--dry-run")
+        self.assertIn("No signals sent", result.stdout)
+        self.assertNotIn("Waiting", result.stdout)
+        self.assertIsNone(process.poll())
+
+    @unittest.skipUnless(SS_AVAILABLE, "iproute2 ss unavailable")
+    def test_interrupt_wait(self):
+        process, port = self.listener(behavior="ignore")
+        stopping = self.pending_stop(port, "--wait", "3600s")
+        stopping.stdin.write(b"yes\n")
+        stopping.stdin.flush()
+        self.read_until(stopping, b"Waiting up to")
+        stopping.send_signal(signal.SIGINT)
+        stopping.communicate(timeout=3)
+        self.assertEqual(stopping.returncode, 130)
+        self.assertIsNone(process.poll())
+
+    @unittest.skipUnless(SS_AVAILABLE, "iproute2 ss unavailable")
+    def test_wait_verification_backend_failure(self):
+        process, port = self.listener()
+        real_ss = shutil.which("ss")
+        body = ("import os, pathlib, sys\n"
+                "counter = pathlib.Path(os.environ['COUNTER'])\n"
+                "count = int(counter.read_text()) if counter.exists() else 0\n"
+                "counter.write_text(str(count + 1))\n"
+                "if count >= 2: sys.exit(1)\n"
+                f"os.execv({real_ss!r}, [{real_ss!r}, *sys.argv[1:]])\n")
+        with self.fake_ss(body) as (env, directory):
+            env["COUNTER"] = str(Path(directory, "count"))
+            result = self.run_cli("stop", port, "--wait", "3s", input="yes\n",
+                                  expected=4, env=env)
+            self.assertIn(f"PID {process.pid} exited.", result.stdout)
+            self.assertIn("socket state could not be verified", result.stderr)
+            self.assertNotIn("no matching listening sockets", result.stdout)
 
     @unittest.skipUnless(SS_AVAILABLE, "iproute2 ss unavailable")
     def test_stop_protocol_scope(self):
         tcp, port = self.listener("tcp")
         udp, _ = self.listener("udp", port=port)
-        self.run_cli("stop", port, "--protocol", "tcp", input="yes\n")
+        result = self.run_cli("stop", port, "--protocol", "tcp", "--wait", "3s", input="yes\n")
+        self.assertIn("no matching listening sockets (TCP)", result.stdout)
         self.assertEqual(tcp.wait(timeout=3), -signal.SIGTERM)
         self.assertIsNone(udp.poll())
 
@@ -263,9 +374,23 @@ class Integration(unittest.TestCase):
         result = self.run_cli("inspect", port)
         self.assertIn(str(first.pid), result.stdout)
         self.assertIn(str(second.pid), result.stdout)
-        self.run_cli("stop", port, input="yes\n")
+        result = self.run_cli("stop", port, "--wait", "3s", input="yes\n")
+        self.assertIn("Processes: 2/2 exited.", result.stdout)
+        self.assertIn("no matching listening sockets", result.stdout)
         self.assertEqual(first.wait(timeout=3), -signal.SIGTERM)
         self.assertEqual(second.wait(timeout=3), -signal.SIGTERM)
+
+    @unittest.skipUnless(SS_AVAILABLE, "iproute2 ss unavailable")
+    def test_wait_partial_exit(self):
+        tcp, port = self.listener("tcp")
+        udp, _ = self.listener("udp", port=port, behavior="ignore")
+        result = self.run_cli("stop", port, "--wait", "150ms", input="yes\n", expected=8)
+        self.assertIn(f"PID {tcp.pid} exited.", result.stdout)
+        self.assertIn(f"PID {udp.pid} still running", result.stdout)
+        self.assertIn("Processes: 1/2 exited.", result.stdout)
+        self.assertIn("matching listening sockets remain", result.stdout)
+        self.assertEqual(tcp.wait(timeout=3), -signal.SIGTERM)
+        self.assertIsNone(udp.poll())
 
 
 if __name__ == "__main__":

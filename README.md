@@ -35,6 +35,7 @@ portkeeper inspect 8080
 portkeeper inspect 5353 --protocol udp
 portkeeper stop 8080 --dry-run
 portkeeper stop 8080
+portkeeper stop 8080 --wait 3s
 ```
 
 Example output (addresses and processes depend on your system):
@@ -64,6 +65,51 @@ requesting confirmation or delivering a termination signal. There is no implicit
 confirmation or force option. **Terminating a process affects all its sockets
 and other work, including sockets on ports you did not select.**
 
+### Verify a stop
+
+Add `--wait DURATION` to observe the processes you signaled and then take a fresh
+socket snapshot. Durations are positive whole seconds (`3` or `3s`) or
+milliseconds (`250ms`), with a maximum of one hour (`3600s`).
+
+```sh
+portkeeper stop 8080 --wait 3s
+portkeeper stop 8080 --protocol tcp --wait 500ms
+```
+
+After confirmation, output distinguishes three events:
+
+```text
+Sent SIGTERM to PID 4012.
+Waiting up to 3000 ms for 1 process(es) to exit.
+PID 4012 exited.
+Processes: 1/1 exited.
+Port 8080: no matching listening sockets (TCP/UDP) at verification.
+```
+
+The process wait uses the original PID descriptors and a shared monotonic
+deadline for all targets. It returns early when all have exited. An exited
+process counts as exited even if its parent has not reaped it yet. Still-running
+targets are reported individually at the deadline. A separate `ss` query then
+reports remaining matching sockets and their visible owners. Newly discovered
+owners are never signaled. `--protocol` applies to this query too.
+
+Exit code `0` with `--wait` means the signaled processes exited and the final
+snapshot contains no matching listening sockets. Code `8` means a target was
+still running at the deadline, even if it released the socket. Code `9` means
+all signaled targets exited but matching sockets remain, for example after a
+replacement process binds the port. A failed final query reports socket state
+as unverified and returns its error code, even if the process wait timed out.
+If signal delivery partially fails, verification covers the signaled subset and
+the original delivery error takes precedence. Interruption stops verification;
+signals already delivered cannot be undone.
+
+The duration bounds the process wait after signal delivery, not the entire
+command: discovery/confirmation happen first, and the final socket query has
+its own existing 15-second timeout. The socket result is a snapshot, not a port
+reservation or a guarantee that a later bind will succeed. Established TCP,
+bound but non-listening TCP, and connected UDP sockets remain outside the query.
+`--dry-run --wait 3s` only validates targets; it neither signals nor waits.
+
 ## Stop safety and visibility
 
 - Socket discovery executes `ss -H -l -n -t -u -p -O -e` with an argument array,
@@ -86,9 +132,10 @@ and other work, including sockets on ports you did not select.**
   Linux does not provide an atomic operation to validate a listening port and
   signal all its owners. A failure during signal delivery can leave some
   targets already signaled; the error reports that count. Interruption can also
-  leave a partially completed stop. A successful stop means SIGTERM was sent;
-  it does not guarantee the process exited or the port is free. A process may
-  ignore SIGTERM, or a service manager may restart it.
+  leave a partially completed stop. Without `--wait`, a successful stop means
+  SIGTERM was sent; it does not guarantee the process exited or the port is
+  free. Use `--wait` to check both outcomes. A process may ignore SIGTERM, or a
+  service manager may restart it after the final snapshot.
 - Visibility depends on your UID, proc mount settings, namespaces, and security
   policy. Unknown owners are shown as `-` / `<unavailable>` with a warning.
   `ss` may omit inaccessible co-owners of a shared socket even when one owner
@@ -101,7 +148,7 @@ and other work, including sockets on ports you did not select.**
 
 | Code | Meaning |
 | --- | --- |
-| 0 | Query/dry-run succeeded, or all intended SIGTERM calls succeeded |
+| 0 | Query/dry-run succeeded; stop delivered SIGTERM; with `--wait`, targets also exited and no matching sockets remained |
 | 1 | Runtime or I/O error; a stop may be partially completed |
 | 2 | Invalid command, option, or port |
 | 3 | No matching socket for inspect/stop (`list` can succeed with no rows) |
@@ -109,6 +156,8 @@ and other work, including sockets on ports you did not select.**
 | 5 | Insufficient permission, unresolved owner, or protected PID |
 | 6 | Process/socket/owner changed; retry after inspecting the port |
 | 7 | Confirmation declined or EOF |
+| 8 | With `--wait`, at least one signaled target was still running at the deadline |
+| 9 | With `--wait`, all signaled targets exited but matching listening sockets remained |
 | 128 + signal | Interrupted (130 for SIGINT, 143 for SIGTERM) |
 
 Codes 5/6 can also occur during delivery after earlier targets received SIGTERM.
@@ -130,7 +179,10 @@ socket-inode verification, PID descriptor signaling, and exited targets. The
 Python integration suite uses isolated subprocesses and ephemeral loopback ports
 to test TCP/UDP, IPv6, shared sockets, dry runs, confirmation/cancellation,
 interruption, port reuse and socket closure during confirmation, and invalid or
-missing `ss`. Live socket cases explicitly skip if `ss` or IPv6 is unavailable.
+missing `ss`. Outcome tests cover TCP/UDP exit, shared owners, mixed exit/timeout,
+ignored SIGTERM, release without exit, replacement owners, protocol selection,
+dry runs, interrupted waits, and failed final verification. Live socket cases
+explicitly skip if `ss` or IPv6 is unavailable.
 Tests only terminate their own fixture processes.
 
 GitHub Actions builds and tests GCC and Clang, with and without combined ASan /

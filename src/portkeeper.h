@@ -8,7 +8,8 @@
 
 enum pk_exit {
     PK_OK = 0, PK_ERROR = 1, PK_USAGE = 2, PK_NOT_FOUND = 3,
-    PK_DEPENDENCY = 4, PK_PERMISSION = 5, PK_CHANGED = 6, PK_CANCELLED = 7
+    PK_DEPENDENCY = 4, PK_PERMISSION = 5, PK_CHANGED = 6, PK_CANCELLED = 7,
+    PK_TIMEOUT = 8, PK_OCCUPIED = 9
 };
 
 typedef struct {
@@ -35,6 +36,7 @@ typedef struct {
 
 extern volatile sig_atomic_t pk_interrupted;
 int pk_port(const char *text, unsigned *port);
+int pk_wait_ms(const char *text, int *milliseconds);
 void pk_sanitize(char *text);
 int pk_parse_line(char *line, pk_snapshot *snapshot);
 void pk_snapshot_free(pk_snapshot *snapshot);
