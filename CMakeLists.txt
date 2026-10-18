@@ -28,6 +28,8 @@ include(CTest)
 if(BUILD_TESTING)
   add_executable(unit_tests tests/unit.c)
   target_link_libraries(unit_tests PRIVATE portkeeper_core)
+  target_compile_definitions(unit_tests PRIVATE
+    PK_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/ss")
   add_test(NAME unit COMMAND unit_tests)
   set_tests_properties(unit PROPERTIES TIMEOUT 15)
   find_package(Python3 COMPONENTS Interpreter REQUIRED)

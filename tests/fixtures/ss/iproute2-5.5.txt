@@ -1,0 +1,5 @@
+tcp   LISTEN   0         4                        [::1]:8080          [::]:*    users:(("python3",pid=1001,fd=5)) uid:1000 ino:70003 sk:3 v6only:1 <->
+tcp   LISTEN   0         4                    127.0.0.1:3000       0.0.0.0:*    users:(("python3",pid=1002,fd=3),("python3",pid=1001,fd=3)) uid:1000 ino:70001 sk:1 <->
+tcp   LISTEN   0         4                    127.0.0.1:9000       0.0.0.0:*    uid:1000 ino:70005 sk:5 <->
+udp   UNCONN   0         0                        [::1]:5354          [::]:*    users:(("python3",pid=1001,fd=6)) uid:1000 ino:70004 sk:4 v6only:1 <->
+udp   UNCONN   0         0                    127.0.0.1:5353       0.0.0.0:*    users:(("python3",pid=1001,fd=4)) uid:1000 ino:70002 sk:2 <->

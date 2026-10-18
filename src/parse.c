@@ -142,10 +142,14 @@ int pk_parse_line(char *line, pk_snapshot *snapshot)
         const char *start = search + 5;
         search = start;
         if (number(start, &end, &pid) < 0 || pid == 0 || pid > INT_MAX ||
-            strncmp(end, ",fd=", 4) != 0)
-            continue;
-        if (number(end + 4, &end, &fd) < 0 || fd > INT_MAX || *end != ')')
-            continue;
+            strncmp(end, ",fd=", 4) != 0) {
+            errno = EPROTO;
+            return -1;
+        }
+        if (number(end + 4, &end, &fd) < 0 || fd > INT_MAX || *end != ')') {
+            errno = EPROTO;
+            return -1;
+        }
         row.pid = (pid_t)pid;
         row.fd = (int)fd;
         if (append(snapshot, &row) < 0)

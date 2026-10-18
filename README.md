@@ -185,9 +185,18 @@ dry runs, interrupted waits, and failed final verification. Live socket cases
 explicitly skip if `ss` or IPv6 is unavailable.
 Tests only terminate their own fixture processes.
 
+Saved captures from iproute2 5.5, 5.15, and 6.1 are checked by the unit tests.
+Permission tests use non-dumpable TCP/UDP listeners to verify unavailable-owner
+reporting and stop refusal. A separate different-UID case runs in the
+unsanitized CI jobs with sudo and explicitly skips during ordinary local runs.
+Malformed PID/descriptor claims reject the complete socket result, including
+when another owner in that result is valid.
+
 GitHub Actions builds and tests GCC and Clang, with and without combined ASan /
-UBSan. Cross-user permission policies and actual numeric PID wraparound/reuse
-are not forced by the tests; the latter is addressed by stable PID descriptors.
+UBSan, and treats compilation warnings as errors. Actual numeric PID
+wraparound/reuse is not forced by the tests; stable PID descriptors address
+that race. See [the compatibility validation record](VALIDATION.md) for compiler
+versions, fixture provenance, results, and remaining verification limits.
 
 The first draft intentionally has no JSON output, watch mode, process-tree
 termination, SIGKILL escalation, service management, remote queries, or port

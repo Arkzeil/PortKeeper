@@ -22,6 +22,56 @@ static void parse(const char *input, pk_snapshot *snapshot, int valid)
     free(line);
 }
 
+static void compatibility_fixtures(void)
+{
+    const char *versions[] = {"5.5", "5.15", "6.1"};
+    const pk_row expected[] = {
+        {.port = 3000, .protocol = "TCP", .address = "127.0.0.1:3000",
+         .inode = 70001, .pid = 1001, .fd = 3},
+        {.port = 3000, .protocol = "TCP", .address = "127.0.0.1:3000",
+         .inode = 70001, .pid = 1002, .fd = 3},
+        {.port = 5353, .protocol = "UDP", .address = "127.0.0.1:5353",
+         .inode = 70002, .pid = 1001, .fd = 4},
+        {.port = 8080, .protocol = "TCP", .address = "[::1]:8080",
+         .inode = 70003, .pid = 1001, .fd = 5},
+        {.port = 5354, .protocol = "UDP", .address = "[::1]:5354",
+         .inode = 70004, .pid = 1001, .fd = 6},
+        {.port = 9000, .protocol = "TCP", .address = "127.0.0.1:9000",
+         .inode = 70005, .pid = 0, .fd = -1}
+    };
+    for (size_t version = 0; version < sizeof(versions) / sizeof(versions[0]); ++version) {
+        char path[4096];
+        CHECK(snprintf(path, sizeof(path), "%s/iproute2-%s.txt",
+                       PK_FIXTURE_DIR, versions[version]) < (int)sizeof(path));
+        FILE *file = fopen(path, "r");
+        CHECK(file != NULL);
+        pk_snapshot snapshot = {0};
+        char *line = NULL;
+        size_t size = 0;
+        while (getline(&line, &size, file) >= 0)
+            CHECK(pk_parse_line(line, &snapshot) == 0);
+        CHECK(!ferror(file));
+        free(line);
+        CHECK(fclose(file) == 0);
+        CHECK(snapshot.count == sizeof(expected) / sizeof(expected[0]));
+        unsigned seen = 0;
+        for (size_t i = 0; i < snapshot.count; ++i) {
+            const pk_row *actual = &snapshot.rows[i];
+            size_t j;
+            for (j = 0; j < sizeof(expected) / sizeof(expected[0]); ++j)
+                if (actual->port == expected[j].port && actual->pid == expected[j].pid)
+                    break;
+            CHECK(j < sizeof(expected) / sizeof(expected[0]));
+            CHECK(!(seen & (1u << j)));
+            seen |= 1u << j;
+            CHECK(strcmp(actual->protocol, expected[j].protocol) == 0);
+            CHECK(strcmp(actual->address, expected[j].address) == 0);
+            CHECK(actual->inode == expected[j].inode && actual->fd == expected[j].fd);
+        }
+        pk_snapshot_free(&snapshot);
+    }
+}
+
 int main(void)
 {
     unsigned port = 0;
@@ -70,12 +120,18 @@ int main(void)
         "tcp ESTAB 0 1 *:80 *:* ino:1 sk:1", "tcp LISTEN 0 1 *:0 *:* ino:1 sk:1",
         "tcp LISTEN 0 1 *:65536 *:* ino:1 sk:1", "tcp LISTEN 0 1 *:80 *:*",
         "tcp LISTEN 0 1 *:80 *:* ino:0 sk:1",
-        "tcp LISTEN 0 1 *:80 *:* ino:18446744073709551616 sk:1"
+        "tcp LISTEN 0 1 *:80 *:* ino:18446744073709551616 sk:1",
+        "tcp LISTEN 0 1 *:80 *:* users:((\"ok\",pid=123,fd=4),"
+        "(\"bad\",pid=99999999999999999999999999,fd=5)) ino:1 sk:1",
+        "tcp LISTEN 0 1 *:80 *:* users:((\"ok\",pid=123,fd=4),"
+        "(\"bad\",pid=456,fd=99999999999999999999999999)) ino:1 sk:1",
+        "tcp LISTEN 0 1 *:80 *:* users:((\"bad\",pid=123,fd=nope)) ino:1 sk:1"
     };
     for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); ++i)
         parse(invalid[i], &snapshot, 0);
     pk_snapshot_free(&snapshot);
     CHECK(snapshot.rows == NULL && snapshot.count == 0);
+    compatibility_fixtures();
 
     int sock = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     CHECK(sock >= 0);

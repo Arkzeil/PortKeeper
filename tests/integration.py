@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Real sockets/processes plus isolated ss failure fixtures; no privileged ports."""
 import contextlib
+import ctypes
 import json
 import os
 from pathlib import Path
@@ -27,7 +28,11 @@ def holder():
         if kind == socket.SOCK_STREAM:
             sock.listen(4)
     behavior = sys.argv[5] if len(sys.argv) > 5 else None
-    if behavior == "ignore":
+    if behavior == "private":
+        libc = ctypes.CDLL(None, use_errno=True)
+        if libc.prctl(4, 0, 0, 0, 0) != 0:  # PR_SET_DUMPABLE
+            raise OSError(ctypes.get_errno(), "PR_SET_DUMPABLE")
+    elif behavior == "ignore":
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
     elif behavior == "close":
         def close_on_term(_signum, _frame):
@@ -149,6 +154,21 @@ class Integration(unittest.TestCase):
             self.assertIn("<unavailable>", result.stdout)
             self.run_cli("stop", 12345, "--dry-run", env=env, expected=5)
 
+    def test_partial_malformed_owner_metadata_refuses_stop(self):
+        process, port = self.listener()
+        descriptors = Path(f"/proc/{process.pid}/fd")
+        descriptor = next(path for path in descriptors.iterdir()
+                          if os.readlink(path).startswith("socket:["))
+        inode = os.readlink(descriptor)[8:-1]
+        row = (f'tcp LISTEN 0 4 127.0.0.1:{port} 0.0.0.0:* '
+               f'users:(("valid",pid={process.pid},fd={descriptor.name}),'
+               f'("invalid",pid=99999999999999999999999999,fd=4)) ino:{inode} sk:1')
+        with self.fake_ss(f"print({row!r})\n") as (env, _):
+            for command in ("inspect", "stop"):
+                result = self.run_cli(command, port, input="yes\n", expected=4, env=env)
+                self.assertIn("cannot parse ss record", result.stderr)
+                self.assertIsNone(process.poll())
+
     def test_empty_and_filter(self):
         with self.fake_ss("pass\n") as (env, _):
             self.run_cli("list", env=env)
@@ -157,6 +177,7 @@ class Integration(unittest.TestCase):
         # A fake backend ignoring sport still must not expose unrelated ports.
         with self.fake_ss("print('tcp LISTEN 0 5 *:12346 *:* ino:9 sk:1')\n") as (env, _):
             self.run_cli("inspect", 12345, env=env, expected=3)
+
 
     def test_exec_arguments(self):
         with self.fake_ss("import json, sys\nprint(json.dumps(sys.argv), file=sys.stderr)\n") as (env, _):
@@ -391,6 +412,56 @@ class Integration(unittest.TestCase):
         self.assertIn("matching listening sockets remain", result.stdout)
         self.assertEqual(tcp.wait(timeout=3), -signal.SIGTERM)
         self.assertIsNone(udp.poll())
+
+    @unittest.skipUnless(SS_AVAILABLE, "iproute2 ss unavailable")
+    def test_permission_restricted_owner(self):
+        for protocol in ("tcp", "udp"):
+            with self.subTest(protocol=protocol):
+                process, port = self.listener(protocol, behavior="private")
+                try:
+                    os.listdir(f"/proc/{process.pid}/fd")
+                except PermissionError:
+                    pass
+                else:
+                    self.skipTest("caller can bypass non-dumpable proc access restrictions")
+                result = self.run_cli("inspect", port, "--protocol", protocol)
+                self.assertIn("<unavailable>", result.stdout)
+                self.assertIn("permissions", result.stderr)
+                for extra in ((), ("--dry-run",), ("--wait", "100ms")):
+                    result = self.run_cli("stop", port, "--protocol", protocol, *extra,
+                                          input="yes\n", expected=5)
+                    self.assertIn("no signals sent", result.stderr)
+                    self.assertIsNone(process.poll())
+
+    @unittest.skipUnless(SS_AVAILABLE and os.geteuid() == 0,
+                         "requires root to create a different-UID caller")
+    def test_cross_user_owner(self):
+        # The test-owned listener stays root-owned. Only the CLI subprocess
+        # drops credentials; no users or system settings are changed.
+        with tempfile.TemporaryDirectory(prefix="portkeeper-cross-user-") as directory:
+            os.chmod(directory, 0o755)
+            executable = Path(directory, "portkeeper")
+            shutil.copy2(BIN, executable)
+            executable.chmod(0o755)
+
+            def drop_credentials():
+                os.setgroups([])
+                os.setgid(65534)
+                os.setuid(65534)
+
+            for protocol in ("tcp", "udp"):
+                process, port = self.listener(protocol)
+                for command, expected in (("inspect", 0), ("stop", 5)):
+                    result = subprocess.run(
+                        [str(executable), command, str(port), "--protocol", protocol],
+                        input="yes\n", text=True, capture_output=True, timeout=10,
+                        env=dict(os.environ, PATH="/usr/bin:/bin"),
+                        preexec_fn=drop_credentials)
+                    self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+                    self.assertIn("<unavailable>", result.stdout)
+                    if command == "stop":
+                        self.assertIn("no signals sent", result.stderr)
+                    self.assertIsNone(process.poll())
 
 
 if __name__ == "__main__":

@@ -17,6 +17,7 @@ jobs:
           CC: ${{ matrix.compiler }}
         run: >-
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_COMPILE_WARNING_AS_ERROR=ON
           -DPORTKEEPER_ASAN=${{ matrix.sanitizers }}
           -DPORTKEEPER_UBSAN=${{ matrix.sanitizers }}
       - name: Build
@@ -26,3 +27,6 @@ jobs:
           ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
         run: ctest --test-dir build --output-on-failure
+      - name: Check different-user ownership refusal
+        if: matrix.sanitizers == 'OFF'
+        run: sudo /usr/bin/python3 tests/integration.py "$PWD/build/portkeeper" Integration.test_cross_user_owner
