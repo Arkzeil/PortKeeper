@@ -99,6 +99,14 @@ class Integration(unittest.TestCase):
         self.assertTrue(line, process.stderr.read() if process.poll() is not None else "holder failed")
         return process, int(line)
 
+    def shared_listeners(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as shared:
+            shared.bind(("127.0.0.1", 0))
+            shared.listen(4)
+            first, port = self.listener(inherited=shared.fileno())
+            second, _ = self.listener(inherited=shared.fileno())
+        return first, second, port
+
     def pending_stop(self, port, *extra):
         process = subprocess.Popen([BIN, "stop", str(port), *extra], stdin=subprocess.PIPE,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -153,6 +161,16 @@ class Integration(unittest.TestCase):
             self.assertIn("iproute2", result.stderr)
         with self.fake_ss("import sys\nprint('partial output')\nsys.exit(1)\n") as (env, _):
             self.run_cli("list", env=env, expected=4)
+
+    def test_pid_arguments(self):
+        for args in [("list", "--pid", "123"), ("inspect", "3000", "--pid", "123"),
+                     ("stop", "3000", "--pid"), ("stop", "--pid", "123"),
+                     ("stop", "3000", "--pid", "123", "--pid", "123"),
+                     ("stop", "3000", "--pid", "123", "--json")]:
+            self.run_cli(*args, expected=2)
+        for pid in ("", "0", "-1", "+123", " 123", "123 ", "123.0", "123;id",
+                    "2147483648", "999999999999999999999999999"):
+            self.run_cli("stop", "3000", "--pid", pid, expected=2)
 
     def test_malformed_ss_and_unknown_owner(self):
         for output in ["broken", "tcp LISTEN 0 5 *:80 *:*", "bad\x00data"]:
@@ -487,11 +505,7 @@ class Integration(unittest.TestCase):
 
     @unittest.skipUnless(SS_AVAILABLE, "iproute2 ss unavailable")
     def test_multiple_owners(self):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as shared:
-            shared.bind(("127.0.0.1", 0))
-            shared.listen(4)
-            first, port = self.listener(inherited=shared.fileno())
-            second, _ = self.listener(inherited=shared.fileno())
+        first, second, port = self.shared_listeners()
         result = self.run_cli("inspect", port)
         self.assertIn(str(first.pid), result.stdout)
         self.assertIn(str(second.pid), result.stdout)
@@ -504,6 +518,128 @@ class Integration(unittest.TestCase):
         self.assertIn("no matching listening sockets", result.stdout)
         self.assertEqual(first.wait(timeout=3), -signal.SIGTERM)
         self.assertEqual(second.wait(timeout=3), -signal.SIGTERM)
+
+    @unittest.skipUnless(SS_AVAILABLE, "iproute2 ss unavailable")
+    def test_pid_selected_shared_stop_and_dry_run(self):
+        first, second, port = self.shared_listeners()
+        result = self.run_cli("stop", "--pid", first.pid, port, "--protocol", "tcp", "--dry-run")
+        self.assertIn(f"Only PID {first.pid} is selected", result.stdout)
+        self.assertIn("would send SIGTERM to 1 process(es)", result.stdout)
+        self.assertNotIn("Type 'yes'", result.stdout)
+        self.assertIsNone(first.poll())
+        self.assertIsNone(second.poll())
+        result = self.run_cli("stop", port, "--pid", first.pid, "--protocol", "tcp", input="yes\n")
+        self.assertIn(f"Sent SIGTERM to PID {first.pid}.", result.stdout)
+        self.assertNotIn(f"Sent SIGTERM to PID {second.pid}.", result.stdout)
+        self.assertEqual(first.wait(timeout=3), -signal.SIGTERM)
+        self.assertIsNone(second.poll())
+
+    @unittest.skipUnless(SS_AVAILABLE, "iproute2 ss unavailable")
+    def test_pid_selected_wait_reports_remaining_owner(self):
+        first, second, port = self.shared_listeners()
+        result = self.run_cli("stop", port, "--pid", first.pid, "--protocol", "tcp",
+                              "--wait", "3s", input="yes\n", expected=9)
+        self.assertIn("Processes: 1/1 exited.", result.stdout)
+        self.assertIn("matching listening sockets remain", result.stdout)
+        self.assertIn(str(second.pid), result.stdout)
+        self.assertNotIn(f"Sent SIGTERM to PID {second.pid}.", result.stdout)
+        self.assertEqual(first.wait(timeout=3), -signal.SIGTERM)
+        self.assertIsNone(second.poll())
+
+    @unittest.skipUnless(SS_AVAILABLE, "iproute2 ss unavailable")
+    def test_pid_non_owner_and_exited_pid_refused(self):
+        owner, port = self.listener()
+        other, _ = self.listener()
+        exited, _ = self.listener()
+        exited.terminate()
+        exited.wait(timeout=3)
+        for pid in (other.pid, exited.pid):
+            result = self.run_cli("stop", port, "--pid", pid, "--protocol", "tcp",
+                                  input="yes\n", expected=3)
+            self.assertIn("not a verified owner", result.stderr)
+            self.assertNotIn("Type 'yes'", result.stdout)
+            self.assertIsNone(owner.poll())
+            self.assertIsNone(other.poll())
+
+    @unittest.skipUnless(SS_AVAILABLE, "iproute2 ss unavailable")
+    def test_pid_protocol_scope(self):
+        tcp, port = self.listener("tcp")
+        udp, _ = self.listener("udp", port=port)
+        self.run_cli("stop", port, "--pid", tcp.pid, "--protocol", "udp",
+                     "--dry-run", expected=3)
+        self.assertIsNone(tcp.poll())
+        self.assertIsNone(udp.poll())
+        result = self.run_cli("stop", port, "--pid", udp.pid, "--protocol", "udp",
+                              "--wait", "3s", input="yes\n")
+        self.assertIn("no matching listening sockets (UDP)", result.stdout)
+        self.assertEqual(udp.wait(timeout=3), -signal.SIGTERM)
+        self.assertIsNone(tcp.poll())
+
+    @unittest.skipUnless(SS_AVAILABLE, "iproute2 ss unavailable")
+    def test_pid_selected_timeout_leaves_other_owner_alive(self):
+        tcp, port = self.listener("tcp", behavior="ignore")
+        udp, _ = self.listener("udp", port=port)
+        result = self.run_cli("stop", port, "--pid", tcp.pid, "--wait", "150ms",
+                              input="yes\n", expected=8)
+        self.assertIn("Processes: 0/1 exited.", result.stdout)
+        self.assertNotIn(f"Sent SIGTERM to PID {udp.pid}.", result.stdout)
+        self.assertIsNone(tcp.poll())
+        self.assertIsNone(udp.poll())
+
+    @unittest.skipUnless(SS_AVAILABLE, "iproute2 ss unavailable")
+    def test_pid_selected_exit_and_replacement_during_confirmation(self):
+        process, port = self.listener()
+        stopping = self.pending_stop(port, "--pid", str(process.pid), "--protocol", "tcp")
+        process.terminate()
+        process.wait(timeout=3)
+        replacement, _ = self.listener(port=port)
+        stdout, stderr = stopping.communicate(b"yes\n", timeout=8)
+        self.assertEqual(stopping.returncode, 6, stdout + stderr)
+        self.assertNotIn(b"Sent SIGTERM", stdout)
+        self.assertIsNone(replacement.poll())
+
+    @unittest.skipUnless(SS_AVAILABLE, "iproute2 ss unavailable")
+    def test_pid_selected_socket_changes_during_confirmation(self):
+        for close_selected in (True, False):
+            with self.subTest(close_selected=close_selected):
+                first, second, port = self.shared_listeners()
+                stopping = self.pending_stop(port, "--pid", str(first.pid), "--protocol", "tcp")
+                closer = first if close_selected else second
+                closer.stdin.write("close\n")
+                closer.stdin.flush()
+                self.assertEqual(closer.stdout.readline().strip(), "closed")
+                stdout, stderr = stopping.communicate(b"yes\n", timeout=8)
+                self.assertEqual(stopping.returncode, 6, stdout + stderr)
+                self.assertNotIn(b"Sent SIGTERM", stdout)
+                self.assertIsNone(first.poll())
+                self.assertIsNone(second.poll())
+
+    @unittest.skipUnless(SS_AVAILABLE, "iproute2 ss unavailable")
+    def test_pid_selected_stop_still_requires_confirmation(self):
+        first, second, port = self.shared_listeners()
+        for answer in ("", "no\n"):
+            result = self.run_cli("stop", port, "--pid", first.pid, "--protocol", "tcp",
+                                  input=answer, expected=7)
+            self.assertIn("Type 'yes'", result.stdout)
+            self.assertNotIn("Sent SIGTERM", result.stdout)
+            self.assertIsNone(first.poll())
+            self.assertIsNone(second.poll())
+
+    @unittest.skipUnless(SS_AVAILABLE, "iproute2 ss unavailable")
+    def test_pid_selection_does_not_bypass_unknown_owner(self):
+        public, port = self.listener("tcp")
+        private, _ = self.listener("udp", port=port, behavior="private")
+        try:
+            os.listdir(f"/proc/{private.pid}/fd")
+        except PermissionError:
+            pass
+        else:
+            self.skipTest("caller can bypass non-dumpable proc access restrictions")
+        result = self.run_cli("stop", port, "--pid", public.pid, input="yes\n", expected=5)
+        self.assertIn("no signals sent", result.stderr)
+        self.assertNotIn("Type 'yes'", result.stdout)
+        self.assertIsNone(public.poll())
+        self.assertIsNone(private.poll())
 
     @unittest.skipUnless(SS_AVAILABLE, "iproute2 ss unavailable")
     def test_wait_partial_exit(self):
@@ -535,7 +671,8 @@ class Integration(unittest.TestCase):
                 row = json.loads(result.stdout)["sockets"][0]
                 for field in ("pid", "process", "command_line", "command_line_truncated"):
                     self.assertIsNone(row[field])
-                for extra in ((), ("--dry-run",), ("--wait", "100ms")):
+                for extra in ((), ("--dry-run",), ("--wait", "100ms"),
+                              ("--pid", str(process.pid))):
                     result = self.run_cli("stop", port, "--protocol", protocol, *extra,
                                           input="yes\n", expected=5)
                     self.assertIn("no signals sent", result.stderr)

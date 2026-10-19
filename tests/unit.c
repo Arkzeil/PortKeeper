@@ -2,6 +2,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -115,6 +116,18 @@ int main(void)
                          "80;id", "80/tcp", "9999999999999999999999999999"};
     for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); ++i)
         CHECK(pk_port(bad[i], &port) < 0);
+    pid_t pid;
+    CHECK(pk_pid("1", &pid) == 0 && pid == 1);
+    CHECK(pk_pid("00123", &pid) == 0 && pid == 123);
+    char maximum_pid[32];
+    snprintf(maximum_pid, sizeof(maximum_pid), "%d", INT_MAX);
+    CHECK(pk_pid(maximum_pid, &pid) == 0 && pid == INT_MAX);
+    snprintf(maximum_pid, sizeof(maximum_pid), "%llu", (unsigned long long)INT_MAX + 1);
+    CHECK(pk_pid(maximum_pid, &pid) < 0);
+    const char *bad_pid[] = {"", "0", "-1", "+1", " 1", "1 ", "1.0", "1;id",
+                             "99999999999999999999999999"};
+    for (size_t i = 0; i < sizeof(bad_pid) / sizeof(bad_pid[0]); ++i)
+        CHECK(pk_pid(bad_pid[i], &pid) < 0);
     int milliseconds;
     CHECK(pk_wait_ms("3", &milliseconds) == 0 && milliseconds == 3000);
     CHECK(pk_wait_ms("3s", &milliseconds) == 0 && milliseconds == 3000);

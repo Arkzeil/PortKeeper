@@ -31,6 +31,16 @@ int pk_port(const char *text, unsigned *port)
     return 0;
 }
 
+int pk_pid(const char *text, pid_t *pid)
+{
+    uint64_t value;
+    const char *end;
+    if (number(text, &end, &value) < 0 || *end || value == 0 || value > INT_MAX)
+        return -1;
+    *pid = (pid_t)value;
+    return 0;
+}
+
 int pk_wait_ms(const char *text, int *milliseconds)
 {
     uint64_t value;

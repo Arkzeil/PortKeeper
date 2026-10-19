@@ -40,6 +40,7 @@ typedef struct {
 
 extern volatile sig_atomic_t pk_interrupted;
 int pk_port(const char *text, unsigned *port);
+int pk_pid(const char *text, pid_t *pid);
 int pk_wait_ms(const char *text, int *milliseconds);
 void pk_sanitize(char *text);
 int pk_parse_line(char *line, pk_snapshot *snapshot);

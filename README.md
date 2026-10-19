@@ -38,6 +38,7 @@ portkeeper inspect 8080 --json
 portkeeper stop 8080 --dry-run
 portkeeper stop 8080
 portkeeper stop 8080 --wait 3s
+portkeeper stop 8080 --protocol tcp --pid 4012 --wait 3s
 ```
 
 Example output (addresses and processes depend on your system):
@@ -61,11 +62,47 @@ connected UDP sockets are intentionally excluded. Rows are sorted by port,
 protocol, address, PID, and socket inode. Multiple owners of a shared socket are
 shown separately, with duplicate descriptors for the same process collapsed.
 
-`stop` displays the targets, then requires the exact answer `yes`. EOF, `no`,
+`stop` displays matching owners, then requires the exact answer `yes`. EOF, `no`,
 and other answers cancel. `--dry-run` validates the visible targets without
 requesting confirmation or delivering a termination signal. There is no implicit
 confirmation or force option. **Terminating a process affects all its sockets
 and other work, including sockets on ports you did not select.**
+
+### Choose one owner
+
+Use `stop PORT --pid PID` to send SIGTERM to one verified owner of the matching
+port and protocol. Without `--pid`, stop still targets every visible owner.
+
+```sh
+portkeeper stop 8080 --pid 4012 --dry-run
+portkeeper stop 8080 --protocol tcp --pid 4012 --wait 3s
+```
+
+The initial table shows all matching owners, and `Only PID 4012 is selected for
+SIGTERM.` identifies the selected target. Other owners are not signaled.
+Confirmation, dry-run, PID descriptor protection, and ownership revalidation
+apply as usual. The selected PID must own at least one matching socket; the
+option cannot be used to terminate an arbitrary process that does not own the
+requested port/protocol. PID 1 and Portkeeper itself remain protected.
+
+PID values must be positive decimal integers representable by a Linux PID
+(at most 2147483647). Missing, malformed, and repeated `--pid` arguments return
+usage error `2`. The option is only accepted by `stop`. With fully visible
+owners, an absent, exited, or non-owner PID returns `3` without confirmation or
+signals. Unresolved owners anywhere in the matching socket snapshot still
+cause refusal with `5`; selecting a known PID does not bypass that policy.
+
+The complete matching snapshot is checked again after confirmation. Changes to
+the selected process, its sockets, or other matching owners abort with `6` and
+send no signals. The chosen process remains pinned by its original PID
+descriptor throughout confirmation and signaling.
+
+With `--wait`, only the selected process is monitored for exit, while the final
+socket query still includes all owners matching the port/protocol. If the
+selected process exits but another owner keeps the port open, the result is
+`9` and the remaining owners are displayed. Stop does not escalate or signal
+those remaining owners. Without `--wait`, successful signal delivery returns
+`0`, even when another owner remains.
 
 ### JSON output
 
@@ -179,7 +216,7 @@ bound but non-listening TCP, and connected UDP sockets remain outside the query.
   socket inode. Process descriptions are read from `/proc`, not parsed from
   quoted process names in `ss`.
 - Before confirmation, stop opens a proc directory and a PID descriptor for
-  each unique owner, checking the proc entry remains live across `pidfd_open`.
+  each targeted unique owner, checking the proc entry remains live across `pidfd_open`.
   The handles stay open until completion. Signals use `pidfd_send_signal`, so a
   recycled numeric PID cannot redirect the signal to a replacement process.
   PID 1 and Portkeeper itself are never stop targets.
@@ -210,7 +247,7 @@ bound but non-listening TCP, and connected UDP sockets remain outside the query.
 | 0 | Query/dry-run succeeded; stop delivered SIGTERM; with `--wait`, targets also exited and no matching sockets remained |
 | 1 | Runtime or I/O error; a stop may be partially completed |
 | 2 | Invalid command, option, or port |
-| 3 | No matching socket for inspect/stop (`list` can succeed with no rows) |
+| 3 | No matching socket or requested stop owner (`list` can succeed with no rows) |
 | 4 | Missing/failed/incompatible `ss`, or unavailable pidfd support |
 | 5 | Insufficient permission, unresolved owner, or protected PID |
 | 6 | Process/socket/owner changed; retry after inspecting the port |
@@ -254,6 +291,10 @@ when another owner in that result is valid.
 JSON tests parse output using Python's JSON decoder and cover null owners,
 empty results, field types, protocol filtering, shared sockets, escaped names
 and arguments, exact command-line capture boundaries, and stdout write failures.
+
+PID-selection tests cover shared owners, dry-run and confirmation, non-owner
+and exited PIDs, protocol filters, ignored SIGTERM, replacement processes,
+socket/owner changes during confirmation, and refusal when an owner is hidden.
 
 GitHub Actions builds and tests GCC and Clang, with and without combined ASan /
 UBSan, and treats compilation warnings as errors. Actual numeric PID

@@ -1,4 +1,4 @@
-# Compatibility validation — 2026-10-18
+# Compatibility validation — 2026-10-19
 
 The expanded suite was run on Ubuntu 24.04, Linux 6.17.0-20-generic, x86-64,
 with Python 3.12.3 and system iproute2 6.1.0.
@@ -10,7 +10,7 @@ with Python 3.12.3 and system iproute2 6.1.0.
 | Clang 18.1.3 | Off | Yes | Pass |
 | Clang 18.1.3 | ASan + UBSan | Yes | Pass |
 
-Each configuration passed the unit executable and 34 integration cases. One
+Each configuration passed the unit executable and 44 integration cases. One
 additional integration case requiring root to create a different-UID caller
 was explicitly skipped locally. ASan leak detection and UBSan halt-on-error
 were enabled. No compiler warnings or sanitizer findings remained.
@@ -43,6 +43,18 @@ stale socket inode and raw capture sizes of 4095, 4096, and 5000 bytes. The
 serializer unit test also covers quotes, backslashes, control bytes, and bytes
 outside printable ASCII.
 
+## PID-selected stops
+
+`stop PORT --pid PID` was checked with shared listeners and separate TCP/UDP
+owners on the same port. Tests verify that only the selected process receives
+SIGTERM, that dry-run and cancellation leave both owners alive, and that
+`--wait` reports a remaining owner with code 9. Other cases cover invalid PID
+syntax, non-owner/exited PIDs, protocol mismatch, ignored SIGTERM, replacement
+listeners, and selected or unselected socket changes during confirmation.
+Selecting a visible PID still refuses when a different matching owner is
+unavailable. PID descriptor protection and full-snapshot revalidation remain
+in place.
+
 ## Permission checks
 
 The local tests create their own TCP and UDP listeners and set
@@ -62,8 +74,8 @@ locally**: sudo requires a password and user namespace UID mapping is denied.
 
 The [existing hosted run for starting revision 4b79079](https://github.com/Arkzeil/PortKeeper/actions/runs/39114329724)
 completed successfully in all four GCC/Clang × sanitizer combinations. The
-new fixtures, parser regression, permission checks, and JSON support were validated locally
-as described above; they have not been pushed or run in hosted CI yet.
+PID-selection changes recorded here were validated locally as described above;
+no hosted CI run was triggered for this change.
 The workflow now also treats compilation warnings as errors and runs the
 different-UID case in its unsanitized jobs.
 

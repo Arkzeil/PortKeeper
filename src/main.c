@@ -13,10 +13,11 @@ static void usage(FILE *stream)
     fputs("Usage:\n"
           "  portkeeper list [--protocol tcp|udp] [--json]\n"
           "  portkeeper inspect PORT [--protocol tcp|udp] [--json]\n"
-          "  portkeeper stop PORT [--protocol tcp|udp] [--dry-run] [--wait DURATION]\n"
+          "  portkeeper stop PORT [--protocol tcp|udp] [--pid PID] [--dry-run] [--wait DURATION]\n"
           "  portkeeper --help | --version\n\n"
           "PORT is a decimal number from 1 to 65535. stop sends SIGTERM to\n"
           "all visible owners after you type 'yes'. --dry-run sends no signals.\n"
+          "--pid selects one verified owner of the matching sockets for stop.\n"
           "--json writes a versioned JSON document for list/inspect.\n"
           "--wait verifies exit and rechecks sockets. DURATION is a positive whole\n"
           "number of seconds (3 or 3s) or milliseconds (250ms), at most 3600s.\n",
@@ -90,10 +91,13 @@ static pk_target *find_target(pk_target *targets, size_t count, pid_t pid)
     return NULL;
 }
 
-static int verify_ownership(const pk_snapshot *snapshot, pk_target *targets, size_t count)
+static int verify_ownership(const pk_snapshot *snapshot, pk_target *targets, size_t count,
+                            pid_t selected_pid)
 {
     for (size_t i = 0; i < snapshot->count; ++i) {
         const pk_row *row = &snapshot->rows[i];
+        if (selected_pid && row->pid != selected_pid)
+            continue;
         pk_target *target = find_target(targets, count, row->pid);
         if (!target) {
             fputs("portkeeper: owner set changed; run the command again\n", stderr);
@@ -233,7 +237,7 @@ static int verify_stop_outcome(unsigned port, const char *protocol,
 }
 
 static int stop_port(unsigned port, const char *protocol, const pk_snapshot *snapshot,
-                     int dry_run, int wait_ms)
+                     int dry_run, int wait_ms, pid_t selected_pid)
 {
     pk_target *targets = calloc(snapshot->count, sizeof(*targets));
     if (!targets) {
@@ -250,6 +254,8 @@ static int stop_port(unsigned port, const char *protocol, const pk_snapshot *sna
             result = PK_PERMISSION;
             goto done;
         }
+        if (selected_pid && pid != selected_pid)
+            continue;
         if (find_target(targets, count, pid))
             continue;
         if (pk_target_open(pid, &targets[count]) < 0) {
@@ -258,9 +264,17 @@ static int stop_port(unsigned port, const char *protocol, const pk_snapshot *sna
         }
         ++count;
     }
-    result = verify_ownership(snapshot, targets, count);
+    if (!count) {
+        fprintf(stderr, "portkeeper: PID %ld is not a verified owner of matching listening "
+                "sockets on port %u; no signals sent\n", (long)selected_pid, port);
+        result = PK_NOT_FOUND;
+        goto done;
+    }
+    result = verify_ownership(snapshot, targets, count, selected_pid);
     if (result != PK_OK)
         goto done;
+    if (selected_pid)
+        printf("Only PID %ld is selected for SIGTERM.\n", (long)selected_pid);
     if (dry_run) {
         printf("Dry run: would send SIGTERM to %zu process(es). No signals sent.\n", count);
         goto done;
@@ -298,7 +312,7 @@ static int stop_port(unsigned port, const char *protocol, const pk_snapshot *sna
     pk_snapshot_free(&fresh);
     if (result != PK_OK)
         goto done;
-    result = verify_ownership(snapshot, targets, count);
+    result = verify_ownership(snapshot, targets, count, selected_pid);
     if (result != PK_OK)
         goto done;
     size_t sent = 0;
@@ -351,6 +365,7 @@ int main(int argc, char **argv)
     int dry_run = 0;
     int wait_ms = 0;
     int json = 0;
+    pid_t selected_pid = 0;
     for (int i = 2; i < argc; ++i) {
         if (strcmp(argv[i], "--protocol") == 0 && !protocol && i + 1 < argc) {
             const char *value = argv[++i];
@@ -367,6 +382,9 @@ int main(int argc, char **argv)
                 goto invalid;
         } else if (strcmp(argv[i], "--json") == 0 && !is_stop && !json) {
             json = 1;
+        } else if (strcmp(argv[i], "--pid") == 0 && is_stop && !selected_pid && i + 1 < argc) {
+            if (pk_pid(argv[++i], &selected_pid) < 0)
+                goto invalid;
         } else if (!is_list && !port && pk_port(argv[i], &port) == 0) {
             /* Strict numeric conversion; no shell or ss expression input. */
         } else {
@@ -414,7 +432,7 @@ int main(int argc, char **argv)
                 perror("portkeeper: write output");
                 result = PK_ERROR;
             } else if (is_stop) {
-                result = stop_port(port, protocol, &snapshot, dry_run, wait_ms);
+                result = stop_port(port, protocol, &snapshot, dry_run, wait_ms, selected_pid);
             }
         }
     }
