@@ -1,0 +1,255 @@
+.TH PORTKEEPER 1 "2026-10-20" "Portkeeper @PROJECT_VERSION@" "User Commands"
+.SH NAME
+portkeeper \- inspect local listening ports and stop their owners
+.SH SYNOPSIS
+.B portkeeper list
+.RB [ \-\-protocol " tcp|udp" ]
+.RB [ \-\-json ]
+.br
+.B portkeeper inspect
+.I PORT
+.RB [ \-\-protocol " tcp|udp" ]
+.RB [ \-\-json ]
+.br
+.B portkeeper stop
+.I PORT
+.RB [ \-\-protocol " tcp|udp" ]
+.RB [ \-\-pid " PID" ]
+.RB [ \-\-dry\-run ]
+.RB [ \-\-wait " DURATION" ]
+.br
+.B portkeeper
+.BR \-\-help " | " \-\-version
+.SH DESCRIPTION
+Portkeeper queries the current Linux network and PID namespace view using
+.BR ss (8).
+It shows TCP listeners and bound, unconnected UDP sockets, including IPv4
+and IPv6, with verified visible PIDs and process names.
+Established TCP connections, bound but non-listening TCP sockets, and
+connected UDP sockets are excluded.
+.PP
+.I PORT
+is a decimal integer from 1 through 65535.
+Both protocols are selected by default.
+Shared sockets have separate rows for each visible owner; duplicate
+descriptors for the same owner are collapsed.
+.SH COMMANDS
+.TP
+.B list
+List matching sockets, sorted by port, protocol, local address, PID, and inode.
+An empty list succeeds.
+.TP
+.BI "inspect " PORT
+Show matching sockets and best-effort process command lines.
+Command-line data is limited to 4095 raw bytes.
+NUL argument separators become spaces and trailing spaces are removed.
+The result is a display string, not a shell command or argument array.
+Command lines may contain secrets.
+.TP
+.BI "stop " PORT
+Display matching owners, then require the exact answer
+.BR yes .
+EOF or any other answer cancels.
+After confirmation, send SIGTERM to each selected owner.
+Terminating a process affects all its sockets and other work, including
+sockets on ports not selected by this command.
+.SH OPTIONS
+Options follow the command; their order relative to the port is flexible.
+Repeated options and unsupported command/option combinations are usage errors.
+.TP
+.BI "\-\-protocol " tcp|udp
+Restrict any command to TCP or UDP sockets.
+.TP
+.BI "\-\-pid " PID
+For stop only, select one verified owner of the matching port and protocol.
+Other owners are not signaled.
+The initial table still shows all matching owners; a following message
+identifies the selected PID.
+.I PID
+must be a positive decimal integer no greater than 2147483647.
+An absent, exited, or non-owner PID returns status 3 when owners are visible.
+Unresolved owners still cause refusal with status 5.
+This option does not bypass confirmation or ownership checks.
+.TP
+.B \-\-dry\-run
+For stop only, validate targets and report the intended SIGTERM operation
+without delivering termination signals or asking for confirmation.
+Combining this option with
+.B \-\-wait
+does not wait.
+.TP
+.BI "\-\-wait " DURATION
+For stop only, observe the signaled processes through their original PID
+descriptors, then query matching sockets again.
+Use a positive whole number of seconds
+.RB ( 3 " or " 3s )
+or milliseconds
+.RB ( 250ms ),
+up to one hour (3600s).
+All targets share one monotonic deadline, starting after signal delivery.
+The wait ends early when all targets have exited, including unreaped zombies.
+.PP
+.RS
+Signal delivery, process exit, and remaining sockets are reported separately.
+A still-running target gives status 8, even if it released its socket.
+If all targets exited but matching sockets remain, status is 9.
+With
+.BR \-\-pid ,
+only the selected process is monitored, but the final socket query includes
+all matching owners.
+Remaining or replacement owners are never signaled by verification.
+The final query has its own 15-second timeout; the wait duration does not
+bound discovery, confirmation, or this final query.
+.RE
+.TP
+.B \-\-json
+For list and inspect only, write one versioned JSON document and a newline
+to standard output. Diagnostics and visibility warnings use standard error.
+See JSON OUTPUT below.
+.TP
+.B \-\-help
+Show usage. Use as the sole argument, without a command.
+.TP
+.B \-\-version
+Show the version. Use as the sole argument, without a command.
+.SH JSON OUTPUT
+The top-level object contains integer
+.B schema_version
+(currently 1) and a
+.B sockets
+array. Each row contains integer
+.BR port ,
+string
+.BR protocol " (tcp or udp),"
+string
+.BR local_address ,
+integer-or-null
+.BR pid ,
+and string-or-null
+.BR process .
+Null means unavailable; a process name equal to a display placeholder is
+still a string when available.
+.PP
+Inspect adds string-or-null
+.B command_line
+and boolean-or-null
+.BR command_line_truncated .
+The latter is true when raw command-line data exceeded the capture limit,
+false for a complete capture, and null when the command line is unavailable.
+List omits both command-line fields and does not read process arguments.
+.PP
+An empty result is:
+.PP
+.nf
+{"schema_version":1,"sockets":[]}
+.fi
+.PP
+An unmatched inspect still writes this object but exits with status 3.
+Argument and discovery failures write no JSON; output errors can leave a
+partial document. Check exit status before using the output.
+Consumers should select fields by name and tolerate additional fields;
+key order and whitespace are not part of the interface.
+Names, arguments, and addresses replace control and non-ASCII bytes with
+question marks. Quotes and backslashes are escaped in JSON strings.
+.SH STOP SAFETY
+Owner PID/descriptor claims are checked against socket inodes in
+.BR /proc .
+Stop pins proc directories and PID descriptors before confirmation;
+signals use
+.BR pidfd_send_signal (2)
+instead of a reusable numeric PID.
+PID 1 and Portkeeper itself are protected.
+.PP
+The complete matching socket/owner snapshot is collected again after
+confirmation. Changes, including changes to unselected matching owners,
+abort before signaling. An unresolved owner in the initial matching
+snapshot refuses the entire stop, even with
+.BR \-\-pid .
+.PP
+Process exit or socket changes can still occur immediately after the last
+check. Delivery to multiple processes is not atomic: an error or interruption
+can leave some targets already signaled.
+Without
+.BR \-\-wait ,
+success only confirms SIGTERM delivery, not exit or a free port.
+A process may ignore SIGTERM or a service manager may restart it.
+The final socket result is a snapshot, not a port reservation or a promise
+that a subsequent bind will succeed.
+.SH VISIBILITY AND REQUIREMENTS
+Requires Linux and iproute2 with
+.B ss
+on a trusted PATH. Stopping additionally requires Linux 5.3 or later with
+PID descriptor operations permitted by the environment.
+No unsafe PID-based fallback is used.
+.PP
+Visibility depends on UID, proc mount settings, namespaces, and security
+policy. Unavailable owners appear as a dash and
+.B <unavailable>
+in the table, or null in JSON.
+ss may omit inaccessible co-owners even when another owner is visible;
+Portkeeper cannot certify that every owner was discovered.
+Use appropriate privileges for the required visibility.
+Setuid/setgid execution and namespace switching are unsupported.
+Malformed results, output exceeding 16 MiB, and queries exceeding
+15 seconds are rejected.
+.SH EXIT STATUS
+.TP
+.B 0
+Query or dry-run succeeded, or SIGTERM delivery succeeded.
+With verification, targets also exited and no matching sockets remained.
+.TP
+.B 1
+Runtime or I/O error; a stop may be partially completed.
+.TP
+.B 2
+Invalid command, option, port, or PID.
+.TP
+.B 3
+No matching socket for inspect/stop, or no requested stop owner.
+.TP
+.B 4
+Missing, failed, or incompatible ss; or unavailable PID descriptor support.
+.TP
+.B 5
+Insufficient permission, unresolved owner, or protected target.
+.TP
+.B 6
+Process, socket, or owner changed. Inspect again before retrying.
+.TP
+.B 7
+Confirmation declined or EOF.
+.TP
+.B 8
+A signaled target was still running at the wait deadline.
+.TP
+.B 9
+All signaled targets exited but matching sockets remained.
+.TP
+.B 128 + signal
+Interrupted; for example, 130 for SIGINT and 143 for SIGTERM.
+.PP
+Statuses 5 and 6 can also occur during delivery after earlier targets
+received SIGTERM. A final query failure overrides the wait result;
+a delivery failure takes precedence over verification of its signaled subset.
+.SH EXAMPLES
+.nf
+portkeeper list
+portkeeper inspect 8080 \-\-json
+portkeeper stop 8080 \-\-dry\-run
+portkeeper stop 8080 \-\-pid 4012 \-\-wait 3s
+.fi
+.SH ENVIRONMENT
+.TP
+.B PATH
+Used to find ss. Use a trusted value, especially with elevated privileges.
+.TP
+.B LC_ALL
+Set to C for the ss child regardless of the caller's locale.
+.SH FILES
+.TP
+.B /proc/PID
+Used for socket ownership, process names, command lines, and identity checks.
+.SH SEE ALSO
+.BR ss (8),
+.BR pidfd_open (2),
+.BR pidfd_send_signal (2)

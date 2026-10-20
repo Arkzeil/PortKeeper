@@ -22,8 +22,12 @@ target_include_directories(portkeeper_core PUBLIC src)
 target_compile_definitions(portkeeper_core PUBLIC _GNU_SOURCE)
 add_executable(portkeeper src/main.c)
 target_link_libraries(portkeeper PRIVATE portkeeper_core)
+target_compile_definitions(portkeeper PRIVATE PORTKEEPER_VERSION="${PROJECT_VERSION}")
 include(GNUInstallDirs)
+configure_file(docs/portkeeper.1.in portkeeper.1 @ONLY)
 install(TARGETS portkeeper RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(FILES "${CMAKE_CURRENT_BINARY_DIR}/portkeeper.1"
+  DESTINATION "${CMAKE_INSTALL_MANDIR}/man1")
 include(CTest)
 if(BUILD_TESTING)
   add_executable(unit_tests tests/unit.c)
@@ -36,4 +40,10 @@ if(BUILD_TESTING)
   add_test(NAME integration COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration.py $<TARGET_FILE:portkeeper>)
   set_tests_properties(integration PROPERTIES TIMEOUT 90)
+  add_test(NAME install_smoke COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/install.py
+    "--cmake=${CMAKE_COMMAND}" "--build-dir=${CMAKE_CURRENT_BINARY_DIR}"
+    "--bindir=${CMAKE_INSTALL_BINDIR}" "--mandir=${CMAKE_INSTALL_MANDIR}"
+    "--version=${PROJECT_VERSION}" "--config=$<CONFIG>")
+  set_tests_properties(install_smoke PROPERTIES TIMEOUT 30)
 endif()

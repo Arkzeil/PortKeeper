@@ -11,7 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build gcc clang iproute2 python3
+        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build gcc clang iproute2 python3 groff-base man-db
       - name: Configure
         env:
           CC: ${{ matrix.compiler }}

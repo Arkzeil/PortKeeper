@@ -350,7 +350,7 @@ int main(int argc, char **argv)
         return PK_OK;
     }
     if (argc == 2 && strcmp(argv[1], "--version") == 0) {
-        puts("portkeeper 0.1.0");
+        puts("portkeeper " PORTKEEPER_VERSION);
         return PK_OK;
     }
     if (argc < 2 || (strcmp(argv[1], "list") && strcmp(argv[1], "inspect") &&
