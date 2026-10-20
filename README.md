@@ -18,6 +18,7 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ctest --test-dir build --output-on-failure
 sudo cmake --install build
+man portkeeper
 ```
 
 To select Clang, configure a fresh build directory with
@@ -25,6 +26,30 @@ To select Clang, configure a fresh build directory with
 `-DBUILD_TESTING=OFF`. No root privileges are needed to build or to query your
 own processes. Use `-DCMAKE_INSTALL_PREFIX="$HOME/.local"` for a local install
 without sudo. The executable is also immediately usable as `./build/portkeeper`.
+
+Installation includes the executable and `portkeeper(1)`. CMake's
+`CMAKE_INSTALL_BINDIR` and `CMAKE_INSTALL_MANDIR` control their destinations;
+the defaults under a normal prefix are `bin` and `share/man`. The manual is
+generated from [docs/portkeeper.1.in](docs/portkeeper.1.in) using the same CMake
+project version as `--version`. Building/installing the manual needs no formatter.
+To read a local-prefix installation explicitly, use
+`man -M "$HOME/.local/share/man" 1 portkeeper` (adjust for a custom man directory).
+
+For a package staging tree, CMake also supports `DESTDIR`:
+
+```sh
+DESTDIR="$PWD/build/stage" cmake --install build --prefix /usr
+```
+
+With the standard relative install directories this places files under
+`build/stage/usr/bin` and `build/stage/usr/share/man/man1`. The test suite checks
+staged installation and runs the installed binary without root privileges.
+Its manual-rendering check requires `groff` and `man`; the check explicitly
+skips if either is unavailable. CI installs both tools. On Debian/Ubuntu,
+`sudo apt-get install groff-base man-db` supplies them for local validation.
+
+The first-release changes are recorded in [CHANGELOG.md](CHANGELOG.md), with
+version 0.1.0 currently marked unreleased.
 
 ## Usage
 
@@ -295,6 +320,12 @@ and arguments, exact command-line capture boundaries, and stdout write failures.
 PID-selection tests cover shared owners, dry-run and confirmation, non-owner
 and exited PIDs, protocol filters, ignored SIGTERM, replacement processes,
 socket/owner changes during confirmation, and refusal when an owner is hidden.
+
+The `install_smoke` test stages a CMake installation into a temporary `DESTDIR`
+with a prefix containing spaces, checks the installed executable and version,
+exercises JSON output and missing-ss diagnostics, and verifies the installed
+manual's version, option coverage, formatting, and discovery through `man -M`.
+The build directory's previous installation manifest is preserved.
 
 GitHub Actions builds and tests GCC and Clang, with and without combined ASan /
 UBSan, and treats compilation warnings as errors. Actual numeric PID

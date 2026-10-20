@@ -1,4 +1,4 @@
-# Compatibility validation — 2026-10-19
+# Compatibility validation — 2026-10-20
 
 The expanded suite was run on Ubuntu 24.04, Linux 6.17.0-20-generic, x86-64,
 with Python 3.12.3 and system iproute2 6.1.0.
@@ -10,9 +10,10 @@ with Python 3.12.3 and system iproute2 6.1.0.
 | Clang 18.1.3 | Off | Yes | Pass |
 | Clang 18.1.3 | ASan + UBSan | Yes | Pass |
 
-Each configuration passed the unit executable and 44 integration cases. One
-additional integration case requiring root to create a different-UID caller
-was explicitly skipped locally. ASan leak detection and UBSan halt-on-error
+Each configuration passed the unit executable, 44 integration cases, and three
+installation checks. One additional integration case, which needs root to
+create a different-UID caller, was explicitly skipped locally.
+ASan leak detection and UBSan halt-on-error
 were enabled. No compiler warnings or sanitizer findings remained.
 
 Clang was extracted from official Ubuntu packages into `/tmp`; no system
@@ -72,12 +73,35 @@ locally**: sudo requires a password and user namespace UID mapping is denied.
 
 ## Hosted CI
 
-The [existing hosted run for starting revision 4b79079](https://github.com/Arkzeil/PortKeeper/actions/runs/39114329724)
-completed successfully in all four GCC/Clang × sanitizer combinations. The
-PID-selection changes recorded here were validated locally as described above;
-no hosted CI run was triggered for this change.
-The workflow now also treats compilation warnings as errors and runs the
-different-UID case in its unsanitized jobs.
+The [hosted run for revision c0e919e](https://github.com/Arkzeil/PortKeeper/actions/runs/39276476443)
+completed successfully in all four GCC/Clang × sanitizer combinations. Its
+different-user ownership refusal step succeeded in both unsanitized jobs:
+[GCC](https://github.com/Arkzeil/PortKeeper/actions/runs/39276476443/job/118141965918)
+and [Clang](https://github.com/Arkzeil/PortKeeper/actions/runs/39276476443/job/118141965855).
+The corresponding steps were intentionally skipped in sanitizer jobs.
+This confirms the cross-user case in hosted CI, although it remains skipped
+during ordinary unprivileged local test runs.
+
+The manual and installation changes were tested locally; no hosted run was
+triggered for those changes. CI now installs groff-base and man-db so manual
+rendering and discovery are checked alongside the compiler matrix.
+
+## Installation and manual
+
+The new `install_smoke` suite uses a temporary `DESTDIR` and an installation
+prefix containing spaces. It runs the installed executable from a separate
+working directory, checks `--version` and `--help`, decodes JSON output with a
+fixture backend, and checks a missing-ss error. The installed manual is compared
+with the configured source, checked for CLI option coverage and exit codes,
+rendered with groff warnings enabled, and located using `man -M`.
+The original build-directory installation manifest is restored after the test.
+
+Version metadata for the binary and manual both comes from CMake's project
+version. The 0.1.0 changelog remains marked unreleased.
+Additional release builds with `BUILD_TESTING=OFF` passed the same installation
+checks using custom relative (`sbin`, `share/manual`) and absolute (`/usr/bin`,
+`/usr/share/man`) destinations, with all writes contained in temporary staging
+trees. The local formatter versions were groff 1.23.0 and man-db 2.12.0.
 
 ## Reproduce a matrix entry
 
