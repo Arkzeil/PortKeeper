@@ -57,11 +57,12 @@ version 0.1.0 currently marked unreleased.
 portkeeper list
 portkeeper list --protocol tcp
 portkeeper list --family ipv4
+portkeeper list --pid 4012 --json
 portkeeper inspect 8080
 portkeeper inspect 5353 --protocol udp
 portkeeper list --json
 portkeeper inspect 8080 --json
-portkeeper inspect 8080 --family ipv6 --json
+portkeeper inspect 8080 --family ipv6 --pid 4012 --json
 portkeeper stop 8080 --dry-run
 portkeeper stop 8080 --family ipv4 --dry-run
 portkeeper stop 8080
@@ -100,7 +101,7 @@ and other work, including sockets on ports you did not select.**
 
 `--family ipv4|ipv6` works with `list`, `inspect`, and `stop`. Both address
 families are included when the option is omitted. It combines with `--protocol`,
-with `--pid` on stop, and with the command's other options.
+`--pid`, and the command's other options.
 
 ```sh
 portkeeper list --family ipv4 --protocol tcp
@@ -119,6 +120,30 @@ outside that family are excluded. With `--wait`, a successful result only checks
 that scope; another family may still have listeners on the port. Terminating a
 selected process still affects all its sockets and work, across both families.
 Missing, invalid, and repeated family arguments are usage errors (`2`).
+
+### Find a process's ports
+
+`list --pid PID` and `inspect PORT --pid PID` show only rows whose socket ownership
+has been verified for that PID. Shared sockets keep the selected owner's row.
+Table and JSON output support the same filter, combined with family and protocol:
+
+```sh
+portkeeper list --pid 4012
+portkeeper list --pid 4012 --protocol tcp --family ipv4 --json
+portkeeper inspect 8080 --pid 4012 --json
+```
+
+An empty filtered list succeeds (`0`). An inspect with no verified match returns
+`3`; with `--json` it still emits the usual empty sockets array. Exited PIDs,
+non-owners, and family/protocol mismatches follow those same rules. Unavailable
+owners cannot be attributed to the requested PID and are omitted, with the
+visibility warning retained on stderr. An empty result cannot establish that
+an inaccessible process owns no sockets. These queries observe the current
+snapshot and do not pin a process across separate invocations.
+
+PID arguments use the same strict validation as stop: positive decimal integers
+up to 2147483647, with missing, malformed, or repeated values returning `2`.
+The PID filter on queries does not change stop's owner selection or safety checks.
 
 ### Choose one owner
 
@@ -139,9 +164,8 @@ requested port/protocol/family. PID 1 and Portkeeper itself remain protected.
 
 PID values must be positive decimal integers representable by a Linux PID
 (at most 2147483647). Missing, malformed, and repeated `--pid` arguments return
-usage error `2`. The option is only accepted by `stop`. With fully visible
-owners, an absent, exited, or non-owner PID returns `3` without confirmation or
-signals. Unresolved owners anywhere in the matching socket snapshot still
+usage error `2`. With fully visible owners, an absent, exited, or non-owner
+PID returns `3` without confirmation or signals. Unresolved owners anywhere in the matching socket snapshot still
 cause refusal with `5`; selecting a known PID does not bypass that policy.
 
 The complete matching snapshot is checked again after confirmation. Changes to
@@ -159,7 +183,7 @@ those remaining owners. Without `--wait`, successful signal delivery returns
 ### JSON output
 
 `list --json` and `inspect PORT --json` write one JSON document followed by a
-newline. `--protocol` and `--family` work with either command.
+newline. `--protocol`, `--family`, and `--pid` work with either command.
 Diagnostics and visibility warnings go to stderr; stdout contains no table, prompt, or warning text.
 
 For example, `portkeeper inspect 8080 --json` can return:
@@ -346,7 +370,9 @@ and arguments, exact command-line capture boundaries, and stdout write failures.
 
 PID-selection tests cover shared owners, dry-run and confirmation, non-owner
 and exited PIDs, protocol filters, ignored SIGTERM, replacement processes,
-socket/owner changes during confirmation, and refusal when an owner is hidden.
+socket/owner changes during confirmation, and refusal when an owner is hidden. Query PID tests check shared owners,
+protocol/family combinations, empty results, exited and unrelated PIDs, and
+rejection of unverified ownership claims while preserving visibility warnings.
 Family tests cover TCP/UDP across both families, dual-stack wildcard sockets,
 consistent discovery arguments through stop verification, and stop scope when
 another family has a hidden owner.

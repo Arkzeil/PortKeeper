@@ -1,4 +1,4 @@
-# Compatibility validation — 2026-10-20
+# Compatibility validation — 2026-10-21
 
 The expanded suite was run on Ubuntu 24.04, Linux 6.17.0-20-generic, x86-64,
 with Python 3.12.3 and system iproute2 6.1.0.
@@ -10,7 +10,7 @@ with Python 3.12.3 and system iproute2 6.1.0.
 | Clang 18.1.3 | Off | Yes | Pass |
 | Clang 18.1.3 | ASan + UBSan | Yes | Pass |
 
-Each configuration passed the unit executable, 44 integration cases, and three
+Each configuration passed the unit executable, 53 integration cases, and three
 installation checks. One additional integration case, which needs root to
 create a different-UID caller, was explicitly skipped locally.
 ASan leak detection and UBSan halt-on-error
@@ -43,6 +43,26 @@ Command-line reads check ownership before and after the read; tests cover a
 stale socket inode and raw capture sizes of 4095, 4096, and 5000 bytes. The
 serializer unit test also covers quotes, backslashes, control bytes, and bytes
 outside printable ASCII.
+
+## Family filtering and PID queries
+
+`--family ipv4|ipv6` was exercised for list, inspect, and stop with TCP and UDP
+listeners sharing a port across IPv4 and IPv6. Tests cover strict family
+arguments, default and selected `ss` arguments, and consistent family selection
+across initial discovery, confirmation revalidation, and final verification.
+Dual-stack wildcard sockets remain IPv6 sockets even when accepting IPv4
+connections. A filtered stop leaves another family's owner untouched and its
+verification excludes that family. Hidden owners inside the matching family
+still refuse stop; hidden owners outside it do not enter the snapshot.
+Selected and unselected ownership changes still abort before signaling.
+
+Query `--pid` tests cover shared owners, multiple ports owned by one process,
+table and JSON output, protocol/family combinations, exited and unrelated PIDs,
+and unmatched inspect/list exit codes. Fake claims naming a live PID with a
+stale descriptor are removed by ownership verification before PID filtering.
+Real non-dumpable owners are also excluded, with exactly one visibility warning
+retained even when another matching owner remains visible or the result is empty.
+Stop retains its complete matching snapshot and existing PID descriptor checks.
 
 ## PID-selected stops
 
@@ -82,8 +102,8 @@ The corresponding steps were intentionally skipped in sanitizer jobs.
 This confirms the cross-user case in hosted CI, although it remains skipped
 during ordinary unprivileged local test runs.
 
-The manual and installation changes were tested locally; no hosted run was
-triggered for those changes. CI now installs groff-base and man-db so manual
+The manual, installation, family-filter, and query-PID changes were tested
+locally; no hosted run was triggered for those changes. CI now installs groff-base and man-db so manual
 rendering and discovery are checked alongside the compiler matrix.
 
 ## Installation and manual
@@ -98,7 +118,7 @@ The original build-directory installation manifest is restored after the test.
 
 Version metadata for the binary and manual both comes from CMake's project
 version. The 0.1.0 changelog remains marked unreleased.
-Additional release builds with `BUILD_TESTING=OFF` passed the same installation
+Earlier release builds with `BUILD_TESTING=OFF` passed the same installation
 checks using custom relative (`sbin`, `share/manual`) and absolute (`/usr/bin`,
 `/usr/share/man`) destinations, with all writes contained in temporary staging
 trees. The local formatter versions were groff 1.23.0 and man-db 2.12.0.

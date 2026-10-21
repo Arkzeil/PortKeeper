@@ -163,14 +163,14 @@ class Integration(unittest.TestCase):
             self.run_cli("list", env=env, expected=4)
 
     def test_pid_arguments(self):
-        for args in [("list", "--pid", "123"), ("inspect", "3000", "--pid", "123"),
-                     ("stop", "3000", "--pid"), ("stop", "--pid", "123"),
-                     ("stop", "3000", "--pid", "123", "--pid", "123"),
-                     ("stop", "3000", "--pid", "123", "--json")]:
-            self.run_cli(*args, expected=2)
-        for pid in ("", "0", "-1", "+123", " 123", "123 ", "123.0", "123;id",
-                    "2147483648", "999999999999999999999999999"):
-            self.run_cli("stop", "3000", "--pid", pid, expected=2)
+        for command in [("list",), ("inspect", "3000"), ("stop", "3000")]:
+            for extra in [("--pid",), ("--pid", "123", "--pid", "123")]:
+                self.run_cli(*command, *extra, expected=2)
+            for pid in ("", "0", "-1", "+123", " 123", "123 ", "123.0", "123;id",
+                        "2147483648", "999999999999999999999999999"):
+                self.run_cli(*command, "--pid", pid, expected=2)
+        self.run_cli("stop", "--pid", "123", expected=2)
+        self.run_cli("stop", "3000", "--pid", "123", "--json", expected=2)
 
     def test_family_arguments_and_backend_flags(self):
         commands = [("list",), ("inspect", "3000"), ("stop", "3000")]
@@ -294,6 +294,103 @@ class Integration(unittest.TestCase):
         self.run_cli("stop", port, "--family", "ipv4", "--wait", "3s", input="yes\n")
         self.assertEqual(public.wait(timeout=3), -signal.SIGTERM)
         self.assertIsNone(private.poll())
+
+    @unittest.skipUnless(SS_AVAILABLE, "iproute2 ss unavailable")
+    def test_pid_queries_filter_verified_shared_owners(self):
+        first, second, port = self.shared_listeners()
+        udp, _ = self.listener("udp", port=port)
+        for command in [("list",), ("inspect", str(port))]:
+            for selected in (first, second):
+                for extra in [(), ("--protocol", "tcp", "--family", "ipv4")]:
+                    result = self.run_cli(*command, "--pid", selected.pid, "--json", *extra)
+                    data = json.loads(result.stdout)
+                    self.assertEqual(data["schema_version"], 1)
+                    self.assertEqual(len(data["sockets"]), 1)
+                    row = data["sockets"][0]
+                    self.assertEqual((row["pid"], row["port"], row["protocol"]),
+                                     (selected.pid, port, "tcp"))
+                    self.assertEqual("command_line" in row, command[0] == "inspect")
+                result = self.run_cli(*command, "--pid", selected.pid, "--protocol", "tcp")
+                self.assertIn(str(selected.pid), result.stdout)
+                self.assertNotIn(str(second.pid if selected is first else first.pid), result.stdout)
+        self.run_cli("inspect", "--pid", udp.pid, port, "--protocol", "udp", "--family", "ipv4")
+        self.assertTrue(all(p.poll() is None for p in (first, second, udp)))
+
+    @unittest.skipUnless(SS_AVAILABLE, "iproute2 ss unavailable")
+    def test_pid_queries_empty_mismatched_and_exited(self):
+        first, port = self.listener()
+        other, _ = self.listener()
+        exited, _ = self.listener()
+        exited.terminate()
+        exited.wait(timeout=3)
+        cases = [(other.pid, ()), (exited.pid, ()),
+                 (first.pid, ("--protocol", "udp")), (first.pid, ("--family", "ipv6"))]
+        for pid, extra in cases:
+            for json_option in [(), ("--json",)]:
+                result = self.run_cli("inspect", port, "--pid", pid, *extra, *json_option, expected=3)
+                self.assertIn("no matching", result.stderr)
+                if json_option:
+                    self.assertEqual(json.loads(result.stdout), {"schema_version": 1, "sockets": []})
+        for json_option in [(), ("--json",)]:
+            result = self.run_cli("list", "--pid", exited.pid, *json_option)
+            if json_option:
+                self.assertEqual(json.loads(result.stdout), {"schema_version": 1, "sockets": []})
+        self.assertIsNone(first.poll())
+        self.assertIsNone(other.poll())
+
+    @unittest.skipUnless(SS_AVAILABLE, "iproute2 ss unavailable")
+    def test_pid_list_collects_multiple_ports(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as tcp, \
+                socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp:
+            tcp.bind(("127.0.0.1", 0))
+            tcp.listen(4)
+            udp.bind(("127.0.0.1", 0))
+            ports = {("tcp", tcp.getsockname()[1]), ("udp", udp.getsockname()[1])}
+            process = subprocess.Popen(
+                [sys.executable, "-c", "import sys; print('ready', flush=True); sys.stdin.read()"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                pass_fds=(tcp.fileno(), udp.fileno()))
+            self.addCleanup(self.cleanup_process, process)
+            self.assertEqual(process.stdout.readline().strip(), "ready")
+        for extra, expected in [((), ports), (("--protocol", "tcp"), {p for p in ports if p[0] == "tcp"})]:
+            result = self.run_cli("list", "--pid", process.pid, "--family", "ipv4", "--json", *extra)
+            rows = json.loads(result.stdout)["sockets"]
+            self.assertEqual({(r["protocol"], r["port"]) for r in rows}, expected)
+            self.assertTrue(all(r["pid"] == process.pid for r in rows))
+        self.assertIsNone(process.poll())
+
+    @unittest.skipUnless(SS_AVAILABLE, "iproute2 ss unavailable")
+    def test_pid_queries_keep_visibility_warning_with_visible_match(self):
+        public, port = self.listener()
+        private, _ = self.listener("udp", port=port, behavior="private")
+        try:
+            os.listdir(f"/proc/{private.pid}/fd")
+        except PermissionError:
+            pass
+        else:
+            self.skipTest("caller can bypass non-dumpable proc access restrictions")
+        for command in [("list",), ("inspect", str(port))]:
+            result = self.run_cli(*command, "--pid", public.pid, "--family", "ipv4", "--json")
+            rows = json.loads(result.stdout)["sockets"]
+            self.assertEqual([(r["pid"], r["port"]) for r in rows], [(public.pid, port)])
+            self.assertEqual(result.stderr.count("some owners are unavailable"), 1)
+            result = self.run_cli(*command, "--pid", private.pid, "--json",
+                                  expected=0 if command[0] == "list" else 3)
+            self.assertEqual(json.loads(result.stdout), {"schema_version": 1, "sockets": []})
+            self.assertEqual(result.stderr.count("some owners are unavailable"), 1)
+        self.assertIsNone(public.poll())
+        self.assertIsNone(private.poll())
+
+    def test_pid_queries_reject_unverified_claims_and_keep_warnings(self):
+        # Even a claim naming this live PID must not survive inode verification.
+        output = (f'tcp LISTEN 0 4 127.0.0.1:3000 0.0.0.0:* '
+                  f'users:(("claimed",pid={os.getpid()},fd=999999)) ino:1 sk:1\n'
+                  'tcp LISTEN 0 4 127.0.0.1:3000 0.0.0.0:* ino:2 sk:2\n')
+        with self.fake_ss(f"print({output!r})\n") as (env, _):
+            for command, code in [(("list",), 0), (("inspect", "3000"), 3)]:
+                result = self.run_cli(*command, "--pid", os.getpid(), "--json", expected=code, env=env)
+                self.assertEqual(json.loads(result.stdout), {"schema_version": 1, "sockets": []})
+                self.assertEqual(result.stderr.count("some owners are unavailable"), 1)
 
     def test_malformed_ss_and_unknown_owner(self):
         for output in ["broken", "tcp LISTEN 0 5 *:80 *:*", "bad\x00data"]:

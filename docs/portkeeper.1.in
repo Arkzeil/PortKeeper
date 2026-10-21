@@ -5,12 +5,14 @@ portkeeper \- inspect local listening ports and stop their owners
 .B portkeeper list
 .RB [ \-\-protocol " tcp|udp" ]
 .RB [ \-\-family " ipv4|ipv6" ]
+.RB [ \-\-pid " PID" ]
 .RB [ \-\-json ]
 .br
 .B portkeeper inspect
 .I PORT
 .RB [ \-\-protocol " tcp|udp" ]
 .RB [ \-\-family " ipv4|ipv6" ]
+.RB [ \-\-pid " PID" ]
 .RB [ \-\-json ]
 .br
 .B portkeeper stop
@@ -72,15 +74,25 @@ other families can still have listeners on the port.
 Terminating a selected process affects all its sockets, across both families.
 .TP
 .BI "\-\-pid " PID
-For stop only, select one verified owner of the matching port, protocol, and family.
+For list and inspect, show only socket rows with verified ownership by this PID.
+The filter combines with protocol and family selection, in table or JSON output.
+An empty list succeeds; an unmatched inspect returns status 3, including for an
+exited PID or a family/protocol mismatch.
+Unavailable owners are omitted but their visibility warning remains on stderr;
+an empty result does not prove an inaccessible process owns no sockets.
+Queries observe a snapshot and do not pin identity across separate invocations.
+.I PID
+must be a positive decimal integer no greater than 2147483647 for all commands.
+.PP
+.RS
+For stop, select one verified owner of the matching port, protocol, and family.
 Other owners are not signaled.
 The initial table still shows all matching owners; a following message
 identifies the selected PID.
-.I PID
-must be a positive decimal integer no greater than 2147483647.
 An absent, exited, or non-owner PID returns status 3 when owners are visible.
 Unresolved owners still cause refusal with status 5.
 This option does not bypass confirmation or ownership checks.
+.RE
 .TP
 .B \-\-dry\-run
 For stop only, validate targets and report the intended SIGTERM operation
@@ -245,8 +257,8 @@ a delivery failure takes precedence over verification of its signaled subset.
 .SH EXAMPLES
 .nf
 portkeeper list
-portkeeper list \-\-family ipv4 \-\-json
-portkeeper inspect 8080 \-\-family ipv6 \-\-json
+portkeeper list \-\-family ipv4 \-\-pid 4012 \-\-json
+portkeeper inspect 8080 \-\-family ipv6 \-\-pid 4012 \-\-json
 portkeeper stop 8080 \-\-dry\-run
 portkeeper stop 8080 \-\-pid 4012 \-\-wait 3s
 .fi

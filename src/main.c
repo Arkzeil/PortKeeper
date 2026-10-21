@@ -11,14 +11,14 @@
 static void usage(FILE *stream)
 {
     fputs("Usage:\n"
-          "  portkeeper list [--protocol tcp|udp] [--family ipv4|ipv6] [--json]\n"
-          "  portkeeper inspect PORT [--protocol tcp|udp] [--family ipv4|ipv6] [--json]\n"
+          "  portkeeper list [--protocol tcp|udp] [--family ipv4|ipv6] [--pid PID] [--json]\n"
+          "  portkeeper inspect PORT [--protocol tcp|udp] [--family ipv4|ipv6] [--pid PID] [--json]\n"
           "  portkeeper stop PORT [--protocol tcp|udp] [--family ipv4|ipv6] [--pid PID] [--dry-run] [--wait DURATION]\n"
           "  portkeeper --help | --version\n\n"
           "PORT is a decimal number from 1 to 65535. stop sends SIGTERM to\n"
           "all visible owners after you type 'yes'. --dry-run sends no signals.\n"
           "--family restricts socket family; both IPv4 and IPv6 are included by default.\n"
-          "--pid selects one verified owner of the matching sockets for stop.\n"
+          "--pid filters verified owners for list/inspect or selects one owner for stop.\n"
           "--json writes a versioned JSON document for list/inspect.\n"
           "--wait verifies exit and rechecks sockets. DURATION is a positive whole\n"
           "number of seconds (3 or 3s) or milliseconds (250ms), at most 3600s.\n",
@@ -395,7 +395,7 @@ int main(int argc, char **argv)
                 goto invalid;
         } else if (strcmp(argv[i], "--json") == 0 && !is_stop && !json) {
             json = 1;
-        } else if (strcmp(argv[i], "--pid") == 0 && is_stop && !selected_pid && i + 1 < argc) {
+        } else if (strcmp(argv[i], "--pid") == 0 && !selected_pid && i + 1 < argc) {
             if (pk_pid(argv[++i], &selected_pid) < 0)
                 goto invalid;
         } else if (!is_list && !port && pk_port(argv[i], &port) == 0) {
@@ -425,6 +425,16 @@ int main(int argc, char **argv)
     }
     pk_snapshot snapshot = {0};
     int result = pk_discover(port, protocol, family, &snapshot);
+    if (result == PK_OK && selected_pid && !is_stop) {
+        /* Unknown owners cannot be attributed to a PID. Keep the visibility
+         * warning even when filtering removes all unavailable rows. */
+        warn_unavailable(&snapshot);
+        size_t kept = 0;
+        for (size_t i = 0; i < snapshot.count; ++i)
+            if (snapshot.rows[i].pid == selected_pid)
+                snapshot.rows[kept++] = snapshot.rows[i];
+        snapshot.count = kept;
+    }
     if (result == PK_OK && json) {
         if (pk_print_json(stdout, &snapshot, !is_list) < 0 || fflush(stdout) == EOF) {
             perror("portkeeper: write JSON output");
@@ -435,7 +445,11 @@ int main(int argc, char **argv)
     }
     if (result == PK_OK) {
         if (!snapshot.count && !is_list) {
-            fprintf(stderr, "portkeeper: no matching listening sockets on port %u\n", port);
+            if (selected_pid && !is_stop)
+                fprintf(stderr, "portkeeper: no matching listening sockets on port %u for PID %ld\n",
+                        port, (long)selected_pid);
+            else
+                fprintf(stderr, "portkeeper: no matching listening sockets on port %u\n", port);
             result = PK_NOT_FOUND;
         } else {
             if (!json)
