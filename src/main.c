@@ -11,12 +11,13 @@
 static void usage(FILE *stream)
 {
     fputs("Usage:\n"
-          "  portkeeper list [--protocol tcp|udp] [--json]\n"
-          "  portkeeper inspect PORT [--protocol tcp|udp] [--json]\n"
-          "  portkeeper stop PORT [--protocol tcp|udp] [--pid PID] [--dry-run] [--wait DURATION]\n"
+          "  portkeeper list [--protocol tcp|udp] [--family ipv4|ipv6] [--json]\n"
+          "  portkeeper inspect PORT [--protocol tcp|udp] [--family ipv4|ipv6] [--json]\n"
+          "  portkeeper stop PORT [--protocol tcp|udp] [--family ipv4|ipv6] [--pid PID] [--dry-run] [--wait DURATION]\n"
           "  portkeeper --help | --version\n\n"
           "PORT is a decimal number from 1 to 65535. stop sends SIGTERM to\n"
           "all visible owners after you type 'yes'. --dry-run sends no signals.\n"
+          "--family restricts socket family; both IPv4 and IPv6 are included by default.\n"
           "--pid selects one verified owner of the matching sockets for stop.\n"
           "--json writes a versioned JSON document for list/inspect.\n"
           "--wait verifies exit and rechecks sockets. DURATION is a positive whole\n"
@@ -209,14 +210,14 @@ done:
     return pk_interrupted ? 128 + pk_interrupted : result;
 }
 
-static int verify_stop_outcome(unsigned port, const char *protocol,
+static int verify_stop_outcome(unsigned port, const char *protocol, enum pk_family family,
                                const pk_target *targets, size_t count, int wait_ms)
 {
     int result = wait_for_exit(targets, count, wait_ms);
     if (result != PK_OK && result != PK_TIMEOUT)
         return result;
     pk_snapshot current = {0};
-    int discovered = pk_discover(port, protocol, &current);
+    int discovered = pk_discover(port, protocol, family, &current);
     if (discovered != PK_OK) {
         fputs("portkeeper: socket state could not be verified; SIGTERM was already sent\n",
               stderr);
@@ -224,6 +225,8 @@ static int verify_stop_outcome(unsigned port, const char *protocol,
         return discovered;
     }
     const char *scope = protocol ? protocol : "TCP/UDP";
+    if (family != PK_ANY_FAMILY)
+        printf("Verifying %s sockets only.\n", family == PK_IPV4 ? "IPv4" : "IPv6");
     if (current.count) {
         printf("Port %u: matching listening sockets remain (%s).\n", port, scope);
         print_snapshot(&current, 0);
@@ -236,7 +239,8 @@ static int verify_stop_outcome(unsigned port, const char *protocol,
     return result;
 }
 
-static int stop_port(unsigned port, const char *protocol, const pk_snapshot *snapshot,
+static int stop_port(unsigned port, const char *protocol, enum pk_family family,
+                     const pk_snapshot *snapshot,
                      int dry_run, int wait_ms, pid_t selected_pid)
 {
     pk_target *targets = calloc(snapshot->count, sizeof(*targets));
@@ -303,7 +307,7 @@ static int stop_port(unsigned port, const char *protocol, const pk_snapshot *sna
         goto done;
     }
     pk_snapshot fresh = {0};
-    result = pk_discover(port, protocol, &fresh);
+    result = pk_discover(port, protocol, family, &fresh);
     if (result == PK_OK && !same_snapshot(snapshot, &fresh)) {
         fputs("portkeeper: sockets or owners changed during confirmation; "
               "no signals sent, run the command again\n", stderr);
@@ -330,7 +334,7 @@ static int stop_port(unsigned port, const char *protocol, const pk_snapshot *sna
         ++sent;
     }
     if (wait_ms && sent && !pk_interrupted) {
-        int outcome = verify_stop_outcome(port, protocol, targets, sent, wait_ms);
+        int outcome = verify_stop_outcome(port, protocol, family, targets, sent, wait_ms);
         /* A delivery failure takes precedence over verification of the subset
          * that received SIGTERM. Never send signals to newly discovered owners. */
         if (result == PK_OK)
@@ -362,6 +366,7 @@ int main(int argc, char **argv)
     int is_stop = strcmp(argv[1], "stop") == 0;
     unsigned port = 0;
     const char *protocol = NULL;
+    enum pk_family family = PK_ANY_FAMILY;
     int dry_run = 0;
     int wait_ms = 0;
     int json = 0;
@@ -373,6 +378,14 @@ int main(int argc, char **argv)
                 protocol = "TCP";
             else if (strcmp(value, "udp") == 0)
                 protocol = "UDP";
+            else
+                goto invalid;
+        } else if (strcmp(argv[i], "--family") == 0 && family == PK_ANY_FAMILY && i + 1 < argc) {
+            const char *value = argv[++i];
+            if (strcmp(value, "ipv4") == 0)
+                family = PK_IPV4;
+            else if (strcmp(value, "ipv6") == 0)
+                family = PK_IPV6;
             else
                 goto invalid;
         } else if (strcmp(argv[i], "--dry-run") == 0 && is_stop && !dry_run) {
@@ -411,7 +424,7 @@ int main(int argc, char **argv)
         return PK_ERROR;
     }
     pk_snapshot snapshot = {0};
-    int result = pk_discover(port, protocol, &snapshot);
+    int result = pk_discover(port, protocol, family, &snapshot);
     if (result == PK_OK && json) {
         if (pk_print_json(stdout, &snapshot, !is_list) < 0 || fflush(stdout) == EOF) {
             perror("portkeeper: write JSON output");
@@ -432,7 +445,7 @@ int main(int argc, char **argv)
                 perror("portkeeper: write output");
                 result = PK_ERROR;
             } else if (is_stop) {
-                result = stop_port(port, protocol, &snapshot, dry_run, wait_ms, selected_pid);
+                result = stop_port(port, protocol, family, &snapshot, dry_run, wait_ms, selected_pid);
             }
         }
     }

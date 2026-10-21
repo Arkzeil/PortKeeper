@@ -35,7 +35,7 @@ static double now(void)
     return (double)time.tv_sec + (double)time.tv_nsec / 1000000000.0;
 }
 
-static int run_ss(unsigned port, char **output)
+static int run_ss(unsigned port, enum pk_family family, char **output)
 {
     int pipes[2];
     if (pipe2(pipes, O_CLOEXEC) < 0) {
@@ -58,10 +58,16 @@ static int run_ss(unsigned port, char **output)
         close(pipes[1]);
         if (setenv("LC_ALL", "C", 1) < 0)
             _exit(126);
-        char *args[] = {"ss", "-H", "-l", "-n", "-t", "-u", "-p", "-O", "-e",
-                        "sport", "=", filter, NULL};
-        if (!port)
-            args[9] = NULL;
+        char *args[14] = {"ss", "-H", "-l", "-n", "-t", "-u", "-p", "-O", "-e"};
+        size_t next = 9;
+        if (family != PK_ANY_FAMILY)
+            args[next++] = family == PK_IPV4 ? "-4" : "-6";
+        if (port) {
+            args[next++] = "sport";
+            args[next++] = "=";
+            args[next++] = filter;
+        }
+        args[next] = NULL;
         execvp(args[0], args);
         int saved = errno;
         perror("portkeeper: cannot execute ss (install iproute2)");
@@ -166,10 +172,11 @@ static int run_ss(unsigned port, char **output)
     return PK_OK;
 }
 
-int pk_discover(unsigned port, const char *protocol, pk_snapshot *snapshot)
+int pk_discover(unsigned port, const char *protocol, enum pk_family family,
+                pk_snapshot *snapshot)
 {
     char *output = NULL;
-    int result = run_ss(port, &output);
+    int result = run_ss(port, family, &output);
     if (result != PK_OK)
         return result;
     char *save = NULL;

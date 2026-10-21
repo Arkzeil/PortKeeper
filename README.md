@@ -56,11 +56,14 @@ version 0.1.0 currently marked unreleased.
 ```sh
 portkeeper list
 portkeeper list --protocol tcp
+portkeeper list --family ipv4
 portkeeper inspect 8080
 portkeeper inspect 5353 --protocol udp
 portkeeper list --json
 portkeeper inspect 8080 --json
+portkeeper inspect 8080 --family ipv6 --json
 portkeeper stop 8080 --dry-run
+portkeeper stop 8080 --family ipv4 --dry-run
 portkeeper stop 8080
 portkeeper stop 8080 --wait 3s
 portkeeper stop 8080 --protocol tcp --pid 4012 --wait 3s
@@ -93,10 +96,34 @@ requesting confirmation or delivering a termination signal. There is no implicit
 confirmation or force option. **Terminating a process affects all its sockets
 and other work, including sockets on ports you did not select.**
 
+### Filter by address family
+
+`--family ipv4|ipv6` works with `list`, `inspect`, and `stop`. Both address
+families are included when the option is omitted. It combines with `--protocol`,
+with `--pid` on stop, and with the command's other options.
+
+```sh
+portkeeper list --family ipv4 --protocol tcp
+portkeeper inspect 8080 --family ipv6 --json
+portkeeper stop 8080 --family ipv4 --wait 3s
+```
+
+The filter selects the socket's family using `ss -4` or `ss -6`, rather than
+inferring it from the displayed address. An IPv6 dual-stack listener belongs to
+`ipv6` even when it also accepts IPv4 traffic. Wildcard and scoped IPv6 addresses
+retain their normal display format; the JSON schema remains version 1.
+
+For stop, the same family applies to initial discovery, the complete matching
+snapshot rechecked after confirmation, and final socket verification. Owners
+outside that family are excluded. With `--wait`, a successful result only checks
+that scope; another family may still have listeners on the port. Terminating a
+selected process still affects all its sockets and work, across both families.
+Missing, invalid, and repeated family arguments are usage errors (`2`).
+
 ### Choose one owner
 
 Use `stop PORT --pid PID` to send SIGTERM to one verified owner of the matching
-port and protocol. Without `--pid`, stop still targets every visible owner.
+port, protocol, and family. Without `--pid`, stop still targets every visible owner.
 
 ```sh
 portkeeper stop 8080 --pid 4012 --dry-run
@@ -108,7 +135,7 @@ SIGTERM.` identifies the selected target. Other owners are not signaled.
 Confirmation, dry-run, PID descriptor protection, and ownership revalidation
 apply as usual. The selected PID must own at least one matching socket; the
 option cannot be used to terminate an arbitrary process that does not own the
-requested port/protocol. PID 1 and Portkeeper itself remain protected.
+requested port/protocol/family. PID 1 and Portkeeper itself remain protected.
 
 PID values must be positive decimal integers representable by a Linux PID
 (at most 2147483647). Missing, malformed, and repeated `--pid` arguments return
@@ -123,7 +150,7 @@ send no signals. The chosen process remains pinned by its original PID
 descriptor throughout confirmation and signaling.
 
 With `--wait`, only the selected process is monitored for exit, while the final
-socket query still includes all owners matching the port/protocol. If the
+socket query still includes all owners matching the port/protocol/family. If the
 selected process exits but another owner keeps the port open, the result is
 `9` and the remaining owners are displayed. Stop does not escalate or signal
 those remaining owners. Without `--wait`, successful signal delivery returns
@@ -132,8 +159,8 @@ those remaining owners. Without `--wait`, successful signal delivery returns
 ### JSON output
 
 `list --json` and `inspect PORT --json` write one JSON document followed by a
-newline. `--protocol` works with either command. Diagnostics and visibility
-warnings go to stderr; stdout contains no table, prompt, or warning text.
+newline. `--protocol` and `--family` work with either command.
+Diagnostics and visibility warnings go to stderr; stdout contains no table, prompt, or warning text.
 
 For example, `portkeeper inspect 8080 --json` can return:
 
@@ -212,7 +239,7 @@ deadline for all targets. It returns early when all have exited. An exited
 process counts as exited even if its parent has not reaped it yet. Still-running
 targets are reported individually at the deadline. A separate `ss` query then
 reports remaining matching sockets and their visible owners. Newly discovered
-owners are never signaled. `--protocol` applies to this query too.
+owners are never signaled. `--protocol` and `--family` apply to this query too.
 
 Exit code `0` with `--wait` means the signaled processes exited and the final
 snapshot contains no matching listening sockets. Code `8` means a target was
@@ -271,7 +298,7 @@ bound but non-listening TCP, and connected UDP sockets remain outside the query.
 | --- | --- |
 | 0 | Query/dry-run succeeded; stop delivered SIGTERM; with `--wait`, targets also exited and no matching sockets remained |
 | 1 | Runtime or I/O error; a stop may be partially completed |
-| 2 | Invalid command, option, or port |
+| 2 | Invalid command, option, port, or PID |
 | 3 | No matching socket or requested stop owner (`list` can succeed with no rows) |
 | 4 | Missing/failed/incompatible `ss`, or unavailable pidfd support |
 | 5 | Insufficient permission, unresolved owner, or protected PID |
@@ -320,6 +347,9 @@ and arguments, exact command-line capture boundaries, and stdout write failures.
 PID-selection tests cover shared owners, dry-run and confirmation, non-owner
 and exited PIDs, protocol filters, ignored SIGTERM, replacement processes,
 socket/owner changes during confirmation, and refusal when an owner is hidden.
+Family tests cover TCP/UDP across both families, dual-stack wildcard sockets,
+consistent discovery arguments through stop verification, and stop scope when
+another family has a hidden owner.
 
 The `install_smoke` test stages a CMake installation into a temporary `DESTDIR`
 with a prefix containing spaces, checks the installed executable and version,

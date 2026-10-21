@@ -1,19 +1,22 @@
-.TH PORTKEEPER 1 "2026-10-20" "Portkeeper @PROJECT_VERSION@" "User Commands"
+.TH PORTKEEPER 1 "2026-10-21" "Portkeeper @PROJECT_VERSION@" "User Commands"
 .SH NAME
 portkeeper \- inspect local listening ports and stop their owners
 .SH SYNOPSIS
 .B portkeeper list
 .RB [ \-\-protocol " tcp|udp" ]
+.RB [ \-\-family " ipv4|ipv6" ]
 .RB [ \-\-json ]
 .br
 .B portkeeper inspect
 .I PORT
 .RB [ \-\-protocol " tcp|udp" ]
+.RB [ \-\-family " ipv4|ipv6" ]
 .RB [ \-\-json ]
 .br
 .B portkeeper stop
 .I PORT
 .RB [ \-\-protocol " tcp|udp" ]
+.RB [ \-\-family " ipv4|ipv6" ]
 .RB [ \-\-pid " PID" ]
 .RB [ \-\-dry\-run ]
 .RB [ \-\-wait " DURATION" ]
@@ -30,7 +33,7 @@ connected UDP sockets are excluded.
 .PP
 .I PORT
 is a decimal integer from 1 through 65535.
-Both protocols are selected by default.
+Both protocols and both address families are selected by default.
 Shared sockets have separate rows for each visible owner; duplicate
 descriptors for the same owner are collapsed.
 .SH COMMANDS
@@ -60,8 +63,16 @@ Repeated options and unsupported command/option combinations are usage errors.
 .BI "\-\-protocol " tcp|udp
 Restrict any command to TCP or UDP sockets.
 .TP
+.BI "\-\-family " ipv4|ipv6
+Restrict any command to IPv4 or IPv6 sockets using ss's family selection.
+An IPv6 dual-stack listener is selected by ipv6, even if it accepts IPv4 traffic.
+The filter applies to initial discovery, stop revalidation, and final verification.
+A successful verified stop only establishes the result for the selected family;
+other families can still have listeners on the port.
+Terminating a selected process affects all its sockets, across both families.
+.TP
 .BI "\-\-pid " PID
-For stop only, select one verified owner of the matching port and protocol.
+For stop only, select one verified owner of the matching port, protocol, and family.
 Other owners are not signaled.
 The initial table still shows all matching owners; a following message
 identifies the selected PID.
@@ -96,7 +107,7 @@ If all targets exited but matching sockets remain, status is 9.
 With
 .BR \-\-pid ,
 only the selected process is monitored, but the final socket query includes
-all matching owners.
+all owners matching the selected port, protocol, and family.
 Remaining or replacement owners are never signaled by verification.
 The final query has its own 15-second timeout; the wait duration does not
 bound discovery, confirmation, or this final query.
@@ -205,7 +216,7 @@ Runtime or I/O error; a stop may be partially completed.
 Invalid command, option, port, or PID.
 .TP
 .B 3
-No matching socket for inspect/stop, or no requested stop owner.
+No matching socket for inspect/stop after filters, or no requested stop owner.
 .TP
 .B 4
 Missing, failed, or incompatible ss; or unavailable PID descriptor support.
@@ -234,7 +245,8 @@ a delivery failure takes precedence over verification of its signaled subset.
 .SH EXAMPLES
 .nf
 portkeeper list
-portkeeper inspect 8080 \-\-json
+portkeeper list \-\-family ipv4 \-\-json
+portkeeper inspect 8080 \-\-family ipv6 \-\-json
 portkeeper stop 8080 \-\-dry\-run
 portkeeper stop 8080 \-\-pid 4012 \-\-wait 3s
 .fi

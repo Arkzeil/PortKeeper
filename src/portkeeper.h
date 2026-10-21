@@ -15,6 +15,8 @@ enum pk_exit {
     PK_TIMEOUT = 8, PK_OCCUPIED = 9
 };
 
+enum pk_family { PK_ANY_FAMILY = 0, PK_IPV4 = 4, PK_IPV6 = 6 };
+
 typedef struct {
     unsigned port;
     char protocol[4];
@@ -45,7 +47,7 @@ int pk_wait_ms(const char *text, int *milliseconds);
 void pk_sanitize(char *text);
 int pk_parse_line(char *line, pk_snapshot *snapshot);
 void pk_snapshot_free(pk_snapshot *snapshot);
-int pk_discover(unsigned port, const char *protocol, pk_snapshot *snapshot);
+int pk_discover(unsigned port, const char *protocol, enum pk_family family, pk_snapshot *snapshot);
 int pk_proc_open(pid_t pid);
 int pk_owns_socket(int procfd, int fd, uint64_t inode);
 void pk_describe(pk_row *row);

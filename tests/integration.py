@@ -172,6 +172,129 @@ class Integration(unittest.TestCase):
                     "2147483648", "999999999999999999999999999"):
             self.run_cli("stop", "3000", "--pid", pid, expected=2)
 
+    def test_family_arguments_and_backend_flags(self):
+        commands = [("list",), ("inspect", "3000"), ("stop", "3000")]
+        for command in commands:
+            for extra in [("--family",), ("--family", "ipv4", "--family", "ipv6")]:
+                self.run_cli(*command, *extra, expected=2)
+            for value in ("", "4", "6", "inet", "IPv4", "ipv4;id", "ipv6 ", "all"):
+                self.run_cli(*command, "--family", value, expected=2)
+        body = ("import json, os, pathlib, sys\n"
+                "pathlib.Path(os.environ['ARGV']).write_text(json.dumps(sys.argv[1:]))\n")
+        with self.fake_ss(body) as (env, directory):
+            env["ARGV"] = str(Path(directory, "args"))
+            for family, flag in [(None, None), ("ipv4", "-4"), ("ipv6", "-6")]:
+                for command in commands:
+                    extra = ("--family", family) if family else ()
+                    self.run_cli(*command, *extra, expected=0 if command[0] == "list" else 3,
+                                 env=env)
+                    args = json.loads(Path(env["ARGV"]).read_text())
+                    expected = ["-H", "-l", "-n", "-t", "-u", "-p", "-O", "-e"]
+                    if flag:
+                        expected.append(flag)
+                    if command[0] != "list":
+                        expected += ["sport", "=", ":3000"]
+                    self.assertEqual(args, expected)
+
+    def require_ipv6(self):
+        if not socket.has_ipv6:
+            self.skipTest("IPv6 unavailable")
+        try:
+            with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as probe:
+                probe.bind(("::1", 0))
+        except OSError:
+            self.skipTest("IPv6 loopback unavailable")
+
+    @unittest.skipUnless(SS_AVAILABLE, "iproute2 ss unavailable")
+    def test_family_queries_and_scoped_stop(self):
+        self.require_ipv6()
+        real_ss = shutil.which("ss")
+        body = ("import json, os, sys\n"
+                "with open(os.environ['CALLS'], 'a') as stream:\n"
+                "    stream.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+                f"os.execv({real_ss!r}, [{real_ss!r}, *sys.argv[1:]])\n")
+        for protocol in ("tcp", "udp"):
+            with self.subTest(protocol=protocol):
+                first, port = self.listener(protocol)
+                second, _ = self.listener(protocol, family="6", port=port)
+                for family, selected, other in [("ipv4", first, second), ("ipv6", second, first)]:
+                    result = self.run_cli("inspect", port, "--family", family, "--protocol", protocol,
+                                          "--json")
+                    self.assertEqual({r["pid"] for r in json.loads(result.stdout)["sockets"]},
+                                     {selected.pid})
+                    result = self.run_cli("list", "--family", family, "--protocol", protocol,
+                                          "--json")
+                    pids = {r["pid"] for r in json.loads(result.stdout)["sockets"]}
+                    self.assertIn(selected.pid, pids)
+                    self.assertNotIn(other.pid, pids)
+                    result = self.run_cli("stop", port, "--family", family, "--protocol", protocol,
+                                          "--dry-run")
+                    self.assertIn(str(selected.pid), result.stdout)
+                    self.assertNotIn(str(other.pid), result.stdout)
+                with self.fake_ss(body) as (env, directory):
+                    env["CALLS"] = str(Path(directory, "calls"))
+                    result = self.run_cli("stop", port, "--family", "ipv4", "--protocol", protocol,
+                                          "--wait", "3s", input="yes\n", env=env)
+                    calls = [json.loads(line) for line in Path(env["CALLS"]).read_text().splitlines()]
+                    self.assertEqual(len(calls), 3)
+                    self.assertTrue(all("-4" in args and "-6" not in args for args in calls))
+                    self.assertTrue(all(args[-3:] == ["sport", "=", f":{port}"] for args in calls))
+                self.assertIn("Verifying IPv4 sockets only", result.stdout)
+                self.assertIn("no matching listening sockets", result.stdout)
+                self.assertEqual(first.wait(timeout=3), -signal.SIGTERM)
+                self.assertIsNone(second.poll())
+                self.run_cli("inspect", port, "--family", "ipv4", "--protocol", protocol, expected=3)
+                self.run_cli("stop", port, "--family", "ipv4", "--protocol", protocol,
+                             "--dry-run", expected=3)
+                result = self.run_cli("stop", port, "--family", "ipv6", "--protocol", protocol,
+                                      "--wait", "3s", input="yes\n")
+                self.assertIn("Verifying IPv6 sockets only", result.stdout)
+                self.assertEqual(second.wait(timeout=3), -signal.SIGTERM)
+
+    @unittest.skipUnless(SS_AVAILABLE, "iproute2 ss unavailable")
+    def test_family_dual_stack_wildcard(self):
+        self.require_ipv6()
+        for protocol, kind in [("tcp", socket.SOCK_STREAM), ("udp", socket.SOCK_DGRAM)]:
+            with self.subTest(protocol=protocol):
+                with socket.socket(socket.AF_INET6, kind) as sock:
+                    try:
+                        sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+                    except OSError:
+                        self.skipTest("dual-stack sockets unavailable")
+                    sock.bind(("::", 0))
+                    if kind == socket.SOCK_STREAM:
+                        sock.listen(4)
+                    process, port = self.listener(inherited=sock.fileno())
+                if kind == socket.SOCK_STREAM:
+                    with socket.create_connection(("127.0.0.1", port), timeout=2):
+                        pass
+                self.run_cli("inspect", port, "--family", "ipv4", "--protocol", protocol, expected=3)
+                result = self.run_cli("inspect", port, "--family", "ipv6", "--protocol", protocol,
+                                      "--json")
+                self.assertEqual({r["pid"] for r in json.loads(result.stdout)["sockets"]}, {process.pid})
+                self.run_cli("stop", port, "--family", "ipv4", "--protocol", protocol,
+                             "--dry-run", expected=3)
+                self.assertIsNone(process.poll())
+                self.run_cli("stop", port, "--family", "ipv6", "--protocol", protocol,
+                             "--wait", "3s", input="yes\n")
+                self.assertEqual(process.wait(timeout=3), -signal.SIGTERM)
+
+    @unittest.skipUnless(SS_AVAILABLE, "iproute2 ss unavailable")
+    def test_family_stop_ignores_unknown_owner_outside_scope(self):
+        self.require_ipv6()
+        public, port = self.listener()
+        private, _ = self.listener(family="6", port=port, behavior="private")
+        try:
+            os.listdir(f"/proc/{private.pid}/fd")
+        except PermissionError:
+            pass
+        else:
+            self.skipTest("caller can bypass non-dumpable proc access restrictions")
+        self.run_cli("stop", port, "--dry-run", expected=5)
+        self.run_cli("stop", port, "--family", "ipv4", "--wait", "3s", input="yes\n")
+        self.assertEqual(public.wait(timeout=3), -signal.SIGTERM)
+        self.assertIsNone(private.poll())
+
     def test_malformed_ss_and_unknown_owner(self):
         for output in ["broken", "tcp LISTEN 0 5 *:80 *:*", "bad\x00data"]:
             with self.fake_ss(f"import sys\nsys.stdout.write({output!r})\n") as (env, _):
@@ -603,7 +726,8 @@ class Integration(unittest.TestCase):
         for close_selected in (True, False):
             with self.subTest(close_selected=close_selected):
                 first, second, port = self.shared_listeners()
-                stopping = self.pending_stop(port, "--pid", str(first.pid), "--protocol", "tcp")
+                stopping = self.pending_stop(port, "--pid", str(first.pid), "--protocol", "tcp",
+                                             "--family", "ipv4")
                 closer = first if close_selected else second
                 closer.stdin.write("close\n")
                 closer.stdin.flush()
@@ -635,7 +759,8 @@ class Integration(unittest.TestCase):
             pass
         else:
             self.skipTest("caller can bypass non-dumpable proc access restrictions")
-        result = self.run_cli("stop", port, "--pid", public.pid, input="yes\n", expected=5)
+        result = self.run_cli("stop", port, "--pid", public.pid, "--family", "ipv4",
+                              input="yes\n", expected=5)
         self.assertIn("no signals sent", result.stderr)
         self.assertNotIn("Type 'yes'", result.stdout)
         self.assertIsNone(public.poll())
