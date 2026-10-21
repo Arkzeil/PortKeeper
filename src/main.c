@@ -11,8 +11,8 @@
 static void usage(FILE *stream)
 {
     fputs("Usage:\n"
-          "  portkeeper list [--protocol tcp|udp] [--family ipv4|ipv6] [--pid PID] [--json]\n"
-          "  portkeeper inspect PORT [--protocol tcp|udp] [--family ipv4|ipv6] [--pid PID] [--json]\n"
+          "  portkeeper list [--protocol tcp|udp] [--family ipv4|ipv6] [--pid PID] [--json] [--watch DURATION]\n"
+          "  portkeeper inspect PORT [--protocol tcp|udp] [--family ipv4|ipv6] [--pid PID] [--json] [--watch DURATION]\n"
           "  portkeeper stop PORT [--protocol tcp|udp] [--family ipv4|ipv6] [--pid PID] [--dry-run] [--wait DURATION]\n"
           "  portkeeper --help | --version\n\n"
           "PORT is a decimal number from 1 to 65535. stop sends SIGTERM to\n"
@@ -20,8 +20,11 @@ static void usage(FILE *stream)
           "--family restricts socket family; both IPv4 and IPv6 are included by default.\n"
           "--pid filters verified owners for list/inspect or selects one owner for stop.\n"
           "--json writes a versioned JSON document for list/inspect.\n"
-          "--wait verifies exit and rechecks sockets. DURATION is a positive whole\n"
-          "number of seconds (3 or 3s) or milliseconds (250ms), at most 3600s.\n",
+          "--watch repeats list/inspect, waiting DURATION after each snapshot.\n"
+          "With --watch --json, each line is one complete JSON snapshot.\n"
+          "--wait verifies exit and rechecks sockets. For --wait/--watch, DURATION\n"
+          "is a positive whole number of seconds (3 or 3s) or milliseconds (250ms),\n"
+          "at most 3600s.\n",
           stream);
 }
 
@@ -132,6 +135,32 @@ static int64_t monotonic_ms(void)
     if (clock_gettime(CLOCK_MONOTONIC, &time) < 0)
         return -1;
     return (int64_t)time.tv_sec * 1000 + time.tv_nsec / 1000000;
+}
+
+static int wait_for_refresh(int interval_ms)
+{
+    int64_t started = monotonic_ms();
+    if (started < 0) {
+        perror("portkeeper: read monotonic clock");
+        return PK_ERROR;
+    }
+    for (;;) {
+        if (pk_interrupted)
+            return 128 + pk_interrupted;
+        int64_t current = monotonic_ms();
+        if (current < 0) {
+            perror("portkeeper: read monotonic clock");
+            return PK_ERROR;
+        }
+        int64_t left = started + interval_ms - current;
+        if (left <= 0)
+            return PK_OK;
+        /* Bound the delay if a signal arrives between the flag check and poll. */
+        if (poll(NULL, 0, left > 100 ? 100 : (int)left) < 0 && errno != EINTR) {
+            perror("portkeeper: wait for refresh");
+            return PK_ERROR;
+        }
+    }
 }
 
 static int wait_for_exit(const pk_target *targets, size_t count, int wait_ms)
@@ -369,6 +398,7 @@ int main(int argc, char **argv)
     enum pk_family family = PK_ANY_FAMILY;
     int dry_run = 0;
     int wait_ms = 0;
+    int watch_ms = 0;
     int json = 0;
     pid_t selected_pid = 0;
     for (int i = 2; i < argc; ++i) {
@@ -392,6 +422,9 @@ int main(int argc, char **argv)
             dry_run = 1;
         } else if (strcmp(argv[i], "--wait") == 0 && is_stop && !wait_ms && i + 1 < argc) {
             if (pk_wait_ms(argv[++i], &wait_ms) < 0)
+                goto invalid;
+        } else if (strcmp(argv[i], "--watch") == 0 && !is_stop && !watch_ms && i + 1 < argc) {
+            if (pk_wait_ms(argv[++i], &watch_ms) < 0)
                 goto invalid;
         } else if (strcmp(argv[i], "--json") == 0 && !is_stop && !json) {
             json = 1;
@@ -423,47 +456,62 @@ int main(int argc, char **argv)
         perror("portkeeper: ignore SIGPIPE");
         return PK_ERROR;
     }
-    pk_snapshot snapshot = {0};
-    int result = pk_discover(port, protocol, family, &snapshot);
-    if (result == PK_OK && selected_pid && !is_stop) {
-        /* Unknown owners cannot be attributed to a PID. Keep the visibility
-         * warning even when filtering removes all unavailable rows. */
-        warn_unavailable(&snapshot);
-        size_t kept = 0;
-        for (size_t i = 0; i < snapshot.count; ++i)
-            if (snapshot.rows[i].pid == selected_pid)
-                snapshot.rows[kept++] = snapshot.rows[i];
-        snapshot.count = kept;
-    }
-    if (result == PK_OK && json) {
-        if (pk_print_json(stdout, &snapshot, !is_list) < 0 || fflush(stdout) == EOF) {
-            perror("portkeeper: write JSON output");
-            result = PK_ERROR;
-        } else {
+    int result = PK_OK;
+    unsigned long long snapshot_number = 0;
+    do {
+        pk_snapshot snapshot = {0};
+        result = pk_discover(port, protocol, family, &snapshot);
+        if (result == PK_OK && selected_pid && !is_stop) {
+            /* Unknown owners cannot be attributed to a PID. Keep the visibility
+             * warning even when filtering removes all unavailable rows. */
             warn_unavailable(&snapshot);
+            size_t kept = 0;
+            for (size_t i = 0; i < snapshot.count; ++i)
+                if (snapshot.rows[i].pid == selected_pid)
+                    snapshot.rows[kept++] = snapshot.rows[i];
+            snapshot.count = kept;
         }
-    }
-    if (result == PK_OK) {
-        if (!snapshot.count && !is_list) {
-            if (selected_pid && !is_stop)
-                fprintf(stderr, "portkeeper: no matching listening sockets on port %u for PID %ld\n",
-                        port, (long)selected_pid);
-            else
-                fprintf(stderr, "portkeeper: no matching listening sockets on port %u\n", port);
-            result = PK_NOT_FOUND;
-        } else {
-            if (!json)
-                print_snapshot(&snapshot, !is_list && !is_stop);
-            /* Output must succeed before asking to perform a destructive action. */
-            if (fflush(stdout) == EOF) {
-                perror("portkeeper: write output");
+        if (result == PK_OK && json) {
+            if (pk_print_json(stdout, &snapshot, !is_list) < 0 || fflush(stdout) == EOF) {
+                perror("portkeeper: write JSON output");
                 result = PK_ERROR;
-            } else if (is_stop) {
-                result = stop_port(port, protocol, family, &snapshot, dry_run, wait_ms, selected_pid);
+            } else {
+                warn_unavailable(&snapshot);
             }
         }
-    }
-    pk_snapshot_free(&snapshot);
+        if (result == PK_OK) {
+            if (!snapshot.count && !is_list && !watch_ms) {
+                if (selected_pid && !is_stop)
+                    fprintf(stderr, "portkeeper: no matching listening sockets on port %u for PID %ld\n",
+                            port, (long)selected_pid);
+                else
+                    fprintf(stderr, "portkeeper: no matching listening sockets on port %u\n", port);
+                result = PK_NOT_FOUND;
+            } else {
+                if (!json) {
+                    if (watch_ms) {
+                        if (snapshot_number)
+                            putchar('\n');
+                        printf("Snapshot %llu\n", ++snapshot_number);
+                    }
+                    print_snapshot(&snapshot, !is_list && !is_stop);
+                    if (watch_ms && !snapshot.count)
+                        puts("No matching listening sockets.");
+                }
+                /* Output must succeed before asking to perform a destructive action. */
+                if (fflush(stdout) == EOF) {
+                    perror("portkeeper: write output");
+                    result = PK_ERROR;
+                } else if (is_stop) {
+                    result = stop_port(port, protocol, family, &snapshot, dry_run, wait_ms, selected_pid);
+                }
+            }
+        }
+        pk_snapshot_free(&snapshot);
+        if (result != PK_OK || !watch_ms)
+            break;
+        result = wait_for_refresh(watch_ms);
+    } while (result == PK_OK && !pk_interrupted);
     if (pk_interrupted) {
         fprintf(stderr, "portkeeper: interrupted by signal %d\n", (int)pk_interrupted);
         result = 128 + pk_interrupted;

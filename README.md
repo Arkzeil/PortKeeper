@@ -58,11 +58,13 @@ portkeeper list
 portkeeper list --protocol tcp
 portkeeper list --family ipv4
 portkeeper list --pid 4012 --json
+portkeeper list --watch 1s
 portkeeper inspect 8080
 portkeeper inspect 5353 --protocol udp
 portkeeper list --json
 portkeeper inspect 8080 --json
 portkeeper inspect 8080 --family ipv6 --pid 4012 --json
+portkeeper inspect 8080 --watch 250ms --json
 portkeeper stop 8080 --dry-run
 portkeeper stop 8080 --family ipv4 --dry-run
 portkeeper stop 8080
@@ -133,9 +135,9 @@ portkeeper list --pid 4012 --protocol tcp --family ipv4 --json
 portkeeper inspect 8080 --pid 4012 --json
 ```
 
-An empty filtered list succeeds (`0`). An inspect with no verified match returns
-`3`; with `--json` it still emits the usual empty sockets array. Exited PIDs,
-non-owners, and family/protocol mismatches follow those same rules. Unavailable
+An empty filtered list succeeds (`0`). Without `--watch`, an inspect with no
+verified match returns `3`; with `--json` it still emits the usual empty sockets
+array. Exited PIDs, non-owners, and family/protocol mismatches follow those same rules. Unavailable
 owners cannot be attributed to the requested PID and are omitted, with the
 visibility warning retained on stderr. An empty result cannot establish that
 an inaccessible process owns no sockets. These queries observe the current
@@ -182,9 +184,10 @@ those remaining owners. Without `--wait`, successful signal delivery returns
 
 ### JSON output
 
-`list --json` and `inspect PORT --json` write one JSON document followed by a
-newline. `--protocol`, `--family`, and `--pid` work with either command.
-Diagnostics and visibility warnings go to stderr; stdout contains no table, prompt, or warning text.
+Without `--watch`, `list --json` and `inspect PORT --json` write one JSON
+document followed by a newline. `--protocol`, `--family`, and `--pid` work with
+either command. Diagnostics and visibility warnings go to stderr; stdout contains
+no table, prompt, or warning text.
 
 For example, `portkeeper inspect 8080 --json` can return:
 
@@ -229,13 +232,53 @@ follow the existing ASCII sanitization policy, with JSON quotes and backslashes
 escaped. NUL argument separators become spaces and trailing spaces are removed;
 the result is a display string, not an argument array or a shell command.
 
-Empty results use `{"schema_version":1,"sockets":[]}`. An empty `list --json`
-succeeds; an unmatched `inspect --json` still returns exit code `3` and writes
-the no-match diagnostic to stderr. Argument and discovery failures write no JSON
-to stdout and retain the existing exit codes. Output failures can leave a partial
-document and return an I/O error. Scripts should check the exit status before
+Empty results use `{"schema_version":1,"sockets":[]}`. Without `--watch`, an
+empty `list --json` succeeds; an unmatched `inspect --json` returns exit code
+`3` and writes the no-match diagnostic to stderr. Argument and initial discovery
+failures write no JSON to stdout and retain the existing exit codes. Output
+failures can leave a partial document and return an I/O error. Scripts should check the exit status before
 using the document. Shared sockets can have multiple rows, one per visible owner.
 `stop --json` is unsupported and returns usage error `2`.
+
+### Watch port changes
+
+`list --watch DURATION` and `inspect PORT --watch DURATION` repeat queries until
+interrupted or a query/output error occurs. `DURATION` is the pause between
+snapshots, not a total runtime: use positive whole seconds (`1` or `1s`) or
+milliseconds (`250ms`), up to one hour (`3600s`). Missing, invalid, and repeated
+values return usage error `2`. Watch is supported by list and inspect.
+
+```sh
+portkeeper list --watch 1s
+portkeeper inspect 8080 --protocol tcp --family ipv4 --watch 250ms
+portkeeper list --pid 4012 --watch 1s --json
+```
+
+The first snapshot is immediate. Each later query starts after the previous
+snapshot has been written and the full interval has elapsed. Queries run one
+at a time, with no catch-up refreshes; discovery and output time add to the
+interval. Each discovery retains its existing 15-second backend timeout.
+Protocol, family, PID, and inspect-detail options apply freshly to every snapshot.
+PID filtering observes the current numeric PID and does not pin identity across
+refreshes; a reused PID may eventually refer to another process.
+
+Table output appends `Snapshot 1`, `Snapshot 2`, and so on, each with a complete
+table, separated by blank lines. Empty tables say `No matching listening sockets.`
+The output is flushed after each snapshot and does not clear the terminal.
+
+With `--json`, stdout is newline-delimited JSON: one complete schema-version-1
+document per snapshot, without table headings or other text. Parse each line
+independently; the complete stream is not a single JSON document. Empty snapshots
+use the usual empty sockets array. The schema and row fields are unchanged.
+Visibility warnings and errors go to stderr and may recur on each refresh.
+
+An empty inspect snapshot keeps watching, including before a listener appears
+or after its owner exits. It does not produce the one-shot no-match status `3`.
+Ctrl-C exits with `130`; SIGTERM and SIGHUP use the existing `128 + signal`
+convention. Interruption also cancels and reaps an active backend query.
+A discovery or output failure ends the watch with its existing error code;
+previously emitted JSON records remain available, but a failed discovery emits
+no record for that refresh and an output failure can leave a partial final line.
 
 ### Verify a stop
 
@@ -323,7 +366,7 @@ bound but non-listening TCP, and connected UDP sockets remain outside the query.
 | 0 | Query/dry-run succeeded; stop delivered SIGTERM; with `--wait`, targets also exited and no matching sockets remained |
 | 1 | Runtime or I/O error; a stop may be partially completed |
 | 2 | Invalid command, option, port, or PID |
-| 3 | No matching socket or requested stop owner (`list` can succeed with no rows) |
+| 3 | No matching socket or requested stop owner (an empty list succeeds; watch keeps running) |
 | 4 | Missing/failed/incompatible `ss`, or unavailable pidfd support |
 | 5 | Insufficient permission, unresolved owner, or protected PID |
 | 6 | Process/socket/owner changed; retry after inspecting the port |
@@ -377,6 +420,11 @@ Family tests cover TCP/UDP across both families, dual-stack wildcard sockets,
 consistent discovery arguments through stop verification, and stop scope when
 another family has a hidden owner.
 
+Watch tests exercise immediate snapshots, interval timing after slow queries,
+numbered tables and newline-delimited JSON, empty-to-listening transitions,
+process exit/replacement, refreshed filters, interrupted waits and active
+queries, backend cleanup, and output failures including a broken pipe.
+
 The `install_smoke` test stages a CMake installation into a temporary `DESTDIR`
 with a prefix containing spaces, checks the installed executable and version,
 exercises JSON output and missing-ss diagnostics, and verifies the installed
@@ -389,9 +437,8 @@ wraparound/reuse is not forced by the tests; stable PID descriptors address
 that race. See [the compatibility validation record](VALIDATION.md) for compiler
 versions, fixture provenance, results, and remaining verification limits.
 
-The first draft intentionally has no watch mode, process-tree
-termination, SIGKILL escalation, service management, remote queries, or port
-reservation. `ss` supplies socket discovery; Portkeeper does not implement a
+The tool intentionally has no process-tree termination, SIGKILL escalation,
+service management, remote queries, or port reservation. `ss` supplies socket discovery; Portkeeper does not implement a
 replacement network scanner or a complete `lsof`/`ss` feature set.
 
 Reference interfaces: [ss(8)](https://man7.org/linux/man-pages/man8/ss.8.html),

@@ -10,7 +10,7 @@ with Python 3.12.3 and system iproute2 6.1.0.
 | Clang 18.1.3 | Off | Yes | Pass |
 | Clang 18.1.3 | ASan + UBSan | Yes | Pass |
 
-Each configuration passed the unit executable, 53 integration cases, and three
+Each configuration passed the unit executable, 62 integration cases, and three
 installation checks. One additional integration case, which needs root to
 create a different-UID caller, was explicitly skipped locally.
 ASan leak detection and UBSan halt-on-error
@@ -64,6 +64,25 @@ Real non-dumpable owners are also excluded, with exactly one visibility warning
 retained even when another matching owner remains visible or the result is empty.
 Stop retains its complete matching snapshot and existing PID descriptor checks.
 
+## Watch mode
+
+`list --watch DURATION` and `inspect PORT --watch DURATION` were checked in all
+four compiler/sanitizer configurations. Nine additional integration cases cover
+strict arguments and rejection on stop, immediate snapshots even with a one-hour
+interval, numbered table output, and independently decoded JSON records.
+Empty inspect snapshots continue through listener appearance, process exit, and
+replacement. PID/protocol filters are reapplied, and family/backend arguments
+remain consistent across refreshes.
+
+A deliberately slow backend verifies that each new query starts only after the
+previous query finishes and the requested interval elapses. SIGINT, SIGTERM,
+and SIGHUP interrupt long refresh intervals promptly with the expected exit
+codes. Interruption during a later backend query also verifies that its child
+has been reaped and that no incomplete discovery record reaches stdout.
+Initial and later backend failures, malformed results, `/dev/full`, and a closed
+output pipe stop watch with the existing error codes. Visibility warnings stay
+on stderr; JSON snapshot fields and schema version remain unchanged.
+
 ## PID-selected stops
 
 `stop PORT --pid PID` was checked with shared listeners and separate TCP/UDP
@@ -102,9 +121,10 @@ The corresponding steps were intentionally skipped in sanitizer jobs.
 This confirms the cross-user case in hosted CI, although it remains skipped
 during ordinary unprivileged local test runs.
 
-The manual, installation, family-filter, and query-PID changes were tested
-locally; no hosted run was triggered for those changes. CI now installs groff-base and man-db so manual
-rendering and discovery are checked alongside the compiler matrix.
+The manual, installation, family-filter, query-PID, and watch changes were tested
+locally; no hosted run was triggered for those changes. CI now installs
+groff-base and man-db so manual rendering and discovery are checked alongside
+the compiler matrix.
 
 ## Installation and manual
 

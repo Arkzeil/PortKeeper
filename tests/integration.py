@@ -162,6 +162,230 @@ class Integration(unittest.TestCase):
         with self.fake_ss("import sys\nprint('partial output')\nsys.exit(1)\n") as (env, _):
             self.run_cli("list", env=env, expected=4)
 
+    def start_watch(self, *arguments, env=None):
+        process = subprocess.Popen([BIN, *map(str, arguments)], stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+        self.addCleanup(self.cleanup_process, process)
+        process.watch_buffer = b""
+        return process
+
+    def watch_document(self, process):
+        deadline = time.monotonic() + 8
+        with selectors.DefaultSelector() as selector:
+            selector.register(process.stdout, selectors.EVENT_READ)
+            while b"\n" not in process.watch_buffer:
+                self.assertLess(time.monotonic(), deadline, process.watch_buffer)
+                if not selector.select(timeout=0.2):
+                    continue
+                chunk = os.read(process.stdout.fileno(), 4096)
+                if not chunk:
+                    self.fail(process.watch_buffer.decode(errors="replace") +
+                              process.stderr.read().decode(errors="replace"))
+                process.watch_buffer += chunk
+        line, process.watch_buffer = process.watch_buffer.split(b"\n", 1)
+        return json.loads(line)
+
+    def watch_until(self, process, predicate):
+        deadline = time.monotonic() + 8
+        while True:
+            document = self.watch_document(process)
+            if predicate(document["sockets"]):
+                return document["sockets"]
+            self.assertLess(time.monotonic(), deadline, document)
+
+    def test_watch_arguments(self):
+        for command in [("list",), ("inspect", "3000")]:
+            for extra in [("--watch",), ("--watch", "1s", "--watch", "2s"),
+                          ("--watch", "1s", "--wait", "1s"),
+                          ("--watch", "1s", "--dry-run")]:
+                self.assertEqual(self.run_cli(*command, *extra, expected=2).stdout, "")
+            for duration in ("", "0", "0ms", "-1", "+1s", "1.5s", "1m", "s", " 1s",
+                             "1s ", "1MS", "3601s", "3600001ms", "1;id",
+                             "99999999999999999999999"):
+                self.run_cli(*command, "--watch", duration, expected=2)
+        for extra in [("--watch", "1s"), ("--watch", "1s", "--dry-run"),
+                      ("--wait", "1s", "--watch", "1s")]:
+            self.run_cli("stop", "3000", *extra, expected=2)
+
+    def test_watch_immediate_snapshot_and_interruptible_interval(self):
+        cases = [("list", "3600s", signal.SIGINT),
+                 ("inspect", "3600000ms", signal.SIGTERM), ("list", "3", signal.SIGHUP)]
+        with self.fake_ss("pass\n") as (env, _):
+            for command, interval, signum in cases:
+                with self.subTest(command=command, interval=interval, signal=signum):
+                    args = (command,) if command == "list" else (command, "3000")
+                    started = time.monotonic()
+                    process = self.start_watch(*args, "--watch", interval, "--json", env=env)
+                    self.assertEqual(self.watch_document(process), {"schema_version": 1, "sockets": []})
+                    self.assertLess(time.monotonic() - started, 4)
+                    started = time.monotonic()
+                    process.send_signal(signum)
+                    stdout, stderr = process.communicate(timeout=3)
+                    self.assertLess(time.monotonic() - started, 2)
+                    self.assertEqual(process.returncode, 128 + signum, stderr)
+                    self.assertEqual(process.watch_buffer + stdout, b"")
+                    self.assertIn(f"interrupted by signal {signum}".encode(), stderr)
+                    self.assertNotIn(b"no matching", stderr)
+
+    def test_watch_json_and_table_snapshots(self):
+        row = 'tcp LISTEN 0 5 127.0.0.1:3000 0.0.0.0:* ino:1 sk:1'
+        body = ("import os, pathlib\n"
+                "counter = pathlib.Path(os.environ['COUNTER'])\n"
+                "count = int(counter.read_text()) if counter.exists() else 0\n"
+                "counter.write_text(str(count + 1))\n"
+                f"if count == 1: print({row!r})\n"
+                "if count == 3: print('broken')\n")
+        for command in [("list",), ("inspect", "3000")]:
+            for json_option in [(), ("--json",)]:
+                with self.subTest(command=command, json=bool(json_option)):
+                    with self.fake_ss(body) as (env, directory):
+                        env['COUNTER'] = str(Path(directory, "count"))
+                        result = self.run_cli(*command, "--watch", "1ms", *json_option,
+                                              expected=4, env=env)
+                        self.assertEqual(Path(env['COUNTER']).read_text(), '4')
+                    if json_option:
+                        documents = [json.loads(line) for line in result.stdout.splitlines()]
+                        self.assertEqual(len(documents), 3)
+                        self.assertTrue(all(d['schema_version'] == 1 for d in documents))
+                        self.assertEqual([len(d['sockets']) for d in documents], [0, 1, 0])
+                        socket_row = documents[1]['sockets'][0]
+                        self.assertEqual(socket_row['port'], 3000)
+                        self.assertIsNone(socket_row['pid'])
+                        self.assertEqual('command_line' in socket_row, command[0] == 'inspect')
+                        self.assertTrue(result.stdout.endswith('\n'))
+                    else:
+                        self.assertTrue(result.stdout.startswith("Snapshot 1\nPORT"))
+                        self.assertIn("\n\nSnapshot 2\nPORT", result.stdout)
+                        self.assertIn("\n\nSnapshot 3\nPORT", result.stdout)
+                        self.assertEqual(result.stdout.count("No matching listening sockets."), 2)
+                        self.assertEqual(result.stdout.count("LOCAL ADDRESS"), 3)
+                        self.assertNotIn('\x1b', result.stdout)
+                    self.assertEqual(result.stderr.count('some owners are unavailable'), 1)
+                    self.assertIn('cannot parse ss record', result.stderr)
+
+    def test_watch_interval_follows_completed_snapshot(self):
+        body = ("import json, os, pathlib, sys, time\n"
+                "path = pathlib.Path(os.environ['CALLS'])\n"
+                "count = len(path.read_text().splitlines()) if path.exists() else 0\n"
+                "start = time.monotonic()\n"
+                "time.sleep(0.08)\n"
+                "with path.open('a') as stream:\n"
+                "    stream.write(json.dumps([start, time.monotonic(), sys.argv[1:]]) + '\\n')\n"
+                "if count == 2: sys.exit(1)\n")
+        with self.fake_ss(body) as (env, directory):
+            env['CALLS'] = str(Path(directory, "calls"))
+            result = self.run_cli('inspect', '3000', '--watch', '200ms', '--family', 'ipv6',
+                                  '--protocol', 'udp', '--pid', os.getpid(), '--json', env=env, expected=4)
+            calls = [json.loads(line) for line in Path(env['CALLS']).read_text().splitlines()]
+            self.assertEqual(len(calls), 3)
+            for before, after in zip(calls, calls[1:]):
+                self.assertGreaterEqual(after[0] - before[1], 0.18)
+            for _, _, arguments in calls:
+                self.assertIn('-6', arguments)
+                self.assertEqual(arguments[-3:], ['sport', '=', ':3000'])
+            self.assertEqual([json.loads(line) for line in result.stdout.splitlines()],
+                             [{'schema_version': 1, 'sockets': []}] * 2)
+
+    def test_watch_initial_discovery_failure(self):
+        for body in (None, "import sys\nsys.exit(1)\n", "print('broken')\n"):
+            with self.fake_ss(body) as (env, _):
+                for command in [('list',), ('inspect', '3000')]:
+                    result = self.run_cli(*command, '--watch', '1ms', '--json', env=env, expected=4)
+                    self.assertEqual(result.stdout, '')
+
+    def test_watch_output_failure_stops_refreshes(self):
+        body = ("import os, pathlib\n"
+                "counter = pathlib.Path(os.environ['COUNTER'])\n"
+                "count = int(counter.read_text()) if counter.exists() else 0\n"
+                "counter.write_text(str(count + 1))\n")
+        for json_option in [(), ('--json',)]:
+            with self.fake_ss(body) as (env, directory), open('/dev/full', 'w') as output:
+                env['COUNTER'] = str(Path(directory, 'count'))
+                result = subprocess.run([BIN, 'list', '--watch', '1ms', *json_option], stdout=output,
+                                        stderr=subprocess.PIPE, env=env, timeout=5)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn(b'write', result.stderr)
+                self.assertEqual(Path(env['COUNTER']).read_text(), '1')
+        with self.fake_ss('pass\n') as (env, _):
+            process = self.start_watch('list', '--watch', '30ms', '--json', env=env)
+            self.watch_document(process)
+            process.stdout.close()
+            process.stdout = None
+            _, stderr = process.communicate(timeout=3)
+            self.assertEqual(process.returncode, 1, stderr)
+            self.assertIn(b'write JSON output', stderr)
+
+    def test_watch_interrupts_active_refresh_and_reaps_backend(self):
+        body = ("import os, pathlib, sys, time\n"
+                "counter = pathlib.Path(os.environ['COUNTER'])\n"
+                "count = int(counter.read_text()) if counter.exists() else 0\n"
+                "counter.write_text(str(count + 1))\n"
+                "if count:\n"
+                "    print(f'backend:{os.getpid()}', file=sys.stderr, flush=True)\n"
+                "    time.sleep(60)\n")
+        with self.fake_ss(body) as (env, directory):
+            env['COUNTER'] = str(Path(directory, 'count'))
+            process = self.start_watch('list', '--watch', '1ms', '--json', env=env)
+            self.watch_document(process)
+            with selectors.DefaultSelector() as selector:
+                selector.register(process.stderr, selectors.EVENT_READ)
+                self.assertTrue(selector.select(timeout=5))
+                backend = int(process.stderr.readline().split(b':')[1])
+            process.send_signal(signal.SIGINT)
+            stdout, stderr = process.communicate(timeout=3)
+            self.assertEqual(process.returncode, 130, stderr)
+            self.assertEqual(process.watch_buffer + stdout, b'')
+            with self.assertRaises(ProcessLookupError):
+                os.kill(backend, 0)
+
+    @unittest.skipUnless(SS_AVAILABLE, 'iproute2 ss unavailable')
+    def test_watch_live_listener_appears_exits_and_is_replaced(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind(('127.0.0.1', 0))
+            port = probe.getsockname()[1]
+        watching = self.start_watch('inspect', port, '--watch', '30ms', '--family', 'ipv4',
+                                    '--protocol', 'tcp', '--json')
+        self.assertEqual(self.watch_document(watching)['sockets'], [])
+        first, _ = self.listener(port=port)
+        rows = self.watch_until(watching, lambda rows: any(r['pid'] == first.pid for r in rows))
+        self.assertIn('--holder', rows[0]['command_line'])
+        first.terminate()
+        first.wait(timeout=3)
+        self.watch_until(watching, lambda rows: not rows)
+        replacement, _ = self.listener(port=port)
+        self.watch_until(watching, lambda rows: any(r['pid'] == replacement.pid for r in rows))
+        watching.send_signal(signal.SIGINT)
+        _, stderr = watching.communicate(timeout=3)
+        self.assertEqual(watching.returncode, 130, stderr)
+        self.assertIsNone(replacement.poll())
+
+    @unittest.skipUnless(SS_AVAILABLE, 'iproute2 ss unavailable')
+    def test_watch_reapplies_pid_and_protocol_filters(self):
+        first, port = self.listener()
+        other, _ = self.listener('udp', port=port)
+        args = ('--watch', '30ms', '--family', 'ipv4', '--protocol', 'tcp', '--pid', first.pid, '--json')
+        for command in [('list',), ('inspect', port)]:
+            watching = self.start_watch(*command, *args)
+            rows = self.watch_document(watching)['sockets']
+            self.assertEqual([(r['pid'], r['protocol']) for r in rows], [(first.pid, 'tcp')])
+            watching.send_signal(signal.SIGINT)
+            _, stderr = watching.communicate(timeout=3)
+            self.assertEqual(watching.returncode, 130, stderr)
+        watching = self.start_watch('inspect', port, *args)
+        self.watch_document(watching)
+        first.stdin.write('close\n')
+        first.stdin.flush()
+        self.assertEqual(first.stdout.readline().strip(), 'closed')
+        self.watch_until(watching, lambda rows: not rows)
+        replacement, _ = self.listener(port=port)
+        # Rebinding the port must not switch a PID-filtered watch to the new owner.
+        for _ in range(3):
+            self.assertEqual(self.watch_document(watching)['sockets'], [])
+        watching.send_signal(signal.SIGINT)
+        _, stderr = watching.communicate(timeout=3)
+        self.assertEqual(watching.returncode, 130, stderr)
+        self.assertTrue(all(p.poll() is None for p in (first, other, replacement)))
+
     def test_pid_arguments(self):
         for command in [("list",), ("inspect", "3000"), ("stop", "3000")]:
             for extra in [("--pid",), ("--pid", "123", "--pid", "123")]:

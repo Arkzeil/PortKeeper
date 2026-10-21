@@ -7,6 +7,7 @@ portkeeper \- inspect local listening ports and stop their owners
 .RB [ \-\-family " ipv4|ipv6" ]
 .RB [ \-\-pid " PID" ]
 .RB [ \-\-json ]
+.RB [ \-\-watch " DURATION" ]
 .br
 .B portkeeper inspect
 .I PORT
@@ -14,6 +15,7 @@ portkeeper \- inspect local listening ports and stop their owners
 .RB [ \-\-family " ipv4|ipv6" ]
 .RB [ \-\-pid " PID" ]
 .RB [ \-\-json ]
+.RB [ \-\-watch " DURATION" ]
 .br
 .B portkeeper stop
 .I PORT
@@ -42,7 +44,7 @@ descriptors for the same owner are collapsed.
 .TP
 .B list
 List matching sockets, sorted by port, protocol, local address, PID, and inode.
-An empty list succeeds.
+An empty list succeeds; in watch mode it keeps watching.
 .TP
 .BI "inspect " PORT
 Show matching sockets and best-effort process command lines.
@@ -76,8 +78,8 @@ Terminating a selected process affects all its sockets, across both families.
 .BI "\-\-pid " PID
 For list and inspect, show only socket rows with verified ownership by this PID.
 The filter combines with protocol and family selection, in table or JSON output.
-An empty list succeeds; an unmatched inspect returns status 3, including for an
-exited PID or a family/protocol mismatch.
+An empty list succeeds; an unmatched one-shot inspect returns status 3, including
+for an exited PID or a family/protocol mismatch. Watch continues through empty results.
 Unavailable owners are omitted but their visibility warning remains on stderr;
 an empty result does not prove an inaccessible process owns no sockets.
 Queries observe a snapshot and do not pin identity across separate invocations.
@@ -125,9 +127,38 @@ The final query has its own 15-second timeout; the wait duration does not
 bound discovery, confirmation, or this final query.
 .RE
 .TP
+.BI "\-\-watch " DURATION
+For list and inspect only, repeat queries until interruption or an error.
+The first snapshot is immediate. After each snapshot is written, wait DURATION
+before starting another query; discovery and output time add to this interval.
+Use positive whole seconds (1 or 1s) or milliseconds (250ms), up to 3600s.
+Queries run one at a time without catch-up refreshes; each backend query retains
+its own 15-second timeout.
+All filters and inspect details are refreshed for every snapshot.
+PID filtering follows the current numeric PID, including possible reuse;
+identity is not pinned across refreshes.
+.PP
+.RS
+Table output appends numbered snapshots separated by blank lines, each with
+a complete table. Empty tables say No matching listening sockets.
+Output is flushed after every snapshot without clearing the terminal.
+With
+.BR \-\-json ,
+write one complete schema-version-1 document per line (newline-delimited JSON),
+without snapshot headings. Parse each line independently.
+Visibility warnings remain on stderr and can recur on each refresh.
+.PP
+Empty inspect snapshots keep watching instead of returning status 3.
+Ctrl-C exits with status 130; SIGTERM and SIGHUP use 128 + signal.
+An active backend query is canceled and reaped on interruption.
+Discovery and output failures end the watch with their existing error codes.
+Earlier JSON records remain available; a failed discovery adds no record,
+and an output error can leave a partial final line.
+.RE
+.TP
 .B \-\-json
 For list and inspect only, write one versioned JSON document and a newline
-to standard output. Diagnostics and visibility warnings use standard error.
+to standard output per snapshot. With watch, the output is newline-delimited JSON. Diagnostics and visibility warnings use standard error.
 See JSON OUTPUT below.
 .TP
 .B \-\-help
@@ -167,9 +198,11 @@ An empty result is:
 {"schema_version":1,"sockets":[]}
 .fi
 .PP
-An unmatched inspect still writes this object but exits with status 3.
-Argument and discovery failures write no JSON; output errors can leave a
-partial document. Check exit status before using the output.
+An unmatched one-shot inspect writes this object but exits with status 3.
+Watch keeps emitting snapshots, including empty ones.
+Argument and initial discovery failures write no JSON; a later discovery failure
+ends watch without adding a record. Output errors can leave a partial final
+document. Check exit status and framing when consuming the output.
 Consumers should select fields by name and tolerate additional fields;
 key order and whitespace are not part of the interface.
 Names, arguments, and addresses replace control and non-ASCII bytes with
@@ -228,7 +261,8 @@ Runtime or I/O error; a stop may be partially completed.
 Invalid command, option, port, or PID.
 .TP
 .B 3
-No matching socket for inspect/stop after filters, or no requested stop owner.
+No matching socket for one-shot inspect/stop after filters, or no requested stop owner.
+Empty watch snapshots do not exit.
 .TP
 .B 4
 Missing, failed, or incompatible ss; or unavailable PID descriptor support.
@@ -257,6 +291,8 @@ a delivery failure takes precedence over verification of its signaled subset.
 .SH EXAMPLES
 .nf
 portkeeper list
+portkeeper list \-\-watch 1s
+portkeeper inspect 8080 \-\-watch 250ms \-\-json
 portkeeper list \-\-family ipv4 \-\-pid 4012 \-\-json
 portkeeper inspect 8080 \-\-family ipv6 \-\-pid 4012 \-\-json
 portkeeper stop 8080 \-\-dry\-run
