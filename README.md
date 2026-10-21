@@ -59,6 +59,7 @@ portkeeper list --protocol tcp
 portkeeper list --family ipv4
 portkeeper list --pid 4012 --json
 portkeeper list --watch 1s
+portkeeper list --ports 3000-3999 --watch 1s
 portkeeper inspect 8080
 portkeeper inspect 5353 --protocol udp
 portkeeper list --json
@@ -98,6 +99,31 @@ and other answers cancel. `--dry-run` validates the visible targets without
 requesting confirmation or delivering a termination signal. There is no implicit
 confirmation or force option. **Terminating a process affects all its sockets
 and other work, including sockets on ports you did not select.**
+
+### Monitor a port range
+
+`list --ports FIRST-LAST` selects an inclusive range of local port numbers.
+Both endpoints must be decimal integers from 1 through 65535, with FIRST less
+than or equal to LAST. A range such as `8080-8080` selects one port; leading
+zeros are accepted. Without this option, list includes all ports.
+
+```sh
+portkeeper list --ports 3000-3999
+portkeeper list --ports 3000-3999 --watch 1s
+portkeeper list --ports 8000-8999 --protocol tcp --family ipv4 --json
+portkeeper list --ports 3000-3999 --pid 4012 --watch 250ms --json
+```
+
+The option works with list in table or JSON output, with or without watch.
+Protocol, family, and PID filters combine with the range. Each refresh uses
+one backend query for the whole range, and Portkeeper checks the range again
+before describing owners or emitting rows. Owners outside the selected range
+do not generate visibility warnings. JSON fields and schema version stay the
+same; an empty filtered list succeeds and watch continues through empty results.
+
+Use one `FIRST-LAST` argument. Missing, malformed, reversed, out-of-bounds, or
+repeated ranges return usage error `2`. This option is available on list;
+inspect and stop continue to take one positional port.
 
 ### Filter by address family
 
@@ -258,7 +284,8 @@ The first snapshot is immediate. Each later query starts after the previous
 snapshot has been written and the full interval has elapsed. Queries run one
 at a time, with no catch-up refreshes; discovery and output time add to the
 interval. Each discovery retains its existing 15-second backend timeout.
-Protocol, family, PID, and inspect-detail options apply freshly to every snapshot.
+Port range, protocol, family, PID, and inspect-detail options apply freshly to
+every snapshot.
 PID filtering observes the current numeric PID and does not pin identity across
 refreshes; a reused PID may eventually refer to another process.
 
@@ -424,6 +451,9 @@ Watch tests exercise immediate snapshots, interval timing after slow queries,
 numbered tables and newline-delimited JSON, empty-to-listening transitions,
 process exit/replacement, refreshed filters, interrupted waits and active
 queries, backend cleanup, and output failures including a broken pipe.
+Range tests cover inclusive bounds, identical endpoints, the full port range,
+invalid arguments, out-of-range backend records, fresh range arguments on every
+watch query, and live TCP/UDP and IPv4/IPv6 filtering with PID selection.
 
 The `install_smoke` test stages a CMake installation into a temporary `DESTDIR`
 with a prefix containing spaces, checks the installed executable and version,

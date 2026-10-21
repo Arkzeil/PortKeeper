@@ -31,6 +31,19 @@ int pk_port(const char *text, unsigned *port)
     return 0;
 }
 
+int pk_port_range(const char *text, unsigned *first, unsigned *last)
+{
+    uint64_t low, high;
+    const char *end;
+    if (number(text, &end, &low) < 0 || *end != '-' ||
+        number(end + 1, &end, &high) < 0 || *end ||
+        low == 0 || high > 65535 || low > high)
+        return -1;
+    *first = (unsigned)low;
+    *last = (unsigned)high;
+    return 0;
+}
+
 int pk_pid(const char *text, pid_t *pid)
 {
     uint64_t value;

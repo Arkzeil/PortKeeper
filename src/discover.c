@@ -35,15 +35,16 @@ static double now(void)
     return (double)time.tv_sec + (double)time.tv_nsec / 1000000000.0;
 }
 
-static int run_ss(unsigned port, enum pk_family family, char **output)
+static int run_ss(unsigned first, unsigned last, enum pk_family family, char **output)
 {
     int pipes[2];
     if (pipe2(pipes, O_CLOEXEC) < 0) {
         perror("portkeeper: pipe");
         return PK_ERROR;
     }
-    char filter[32];
-    snprintf(filter, sizeof(filter), ":%u", port);
+    char lower[32], upper[32];
+    snprintf(lower, sizeof(lower), ":%u", first);
+    snprintf(upper, sizeof(upper), ":%u", last);
     pid_t child = fork();
     if (child < 0) {
         perror("portkeeper: fork");
@@ -58,14 +59,20 @@ static int run_ss(unsigned port, enum pk_family family, char **output)
         close(pipes[1]);
         if (setenv("LC_ALL", "C", 1) < 0)
             _exit(126);
-        char *args[14] = {"ss", "-H", "-l", "-n", "-t", "-u", "-p", "-O", "-e"};
+        char *args[18] = {"ss", "-H", "-l", "-n", "-t", "-u", "-p", "-O", "-e"};
         size_t next = 9;
         if (family != PK_ANY_FAMILY)
             args[next++] = family == PK_IPV4 ? "-4" : "-6";
-        if (port) {
+        if (first) {
             args[next++] = "sport";
-            args[next++] = "=";
-            args[next++] = filter;
+            args[next++] = first == last ? "=" : ">=";
+            args[next++] = lower;
+            if (first != last) {
+                args[next++] = "and";
+                args[next++] = "sport";
+                args[next++] = "<=";
+                args[next++] = upper;
+            }
         }
         args[next] = NULL;
         execvp(args[0], args);
@@ -172,11 +179,11 @@ static int run_ss(unsigned port, enum pk_family family, char **output)
     return PK_OK;
 }
 
-int pk_discover(unsigned port, const char *protocol, enum pk_family family,
-                pk_snapshot *snapshot)
+int pk_discover(unsigned first, unsigned last, const char *protocol,
+                enum pk_family family, pk_snapshot *snapshot)
 {
     char *output = NULL;
-    int result = run_ss(port, family, &output);
+    int result = run_ss(first, last, family, &output);
     if (result != PK_OK)
         return result;
     char *save = NULL;
@@ -201,7 +208,7 @@ int pk_discover(unsigned port, const char *protocol, enum pk_family family,
     size_t kept = 0;
     for (size_t i = 0; i < snapshot->count; ++i) {
         pk_row *row = &snapshot->rows[i];
-        if ((port && row->port != port) ||
+        if ((first && (row->port < first || row->port > last)) ||
             (protocol && strcmp(row->protocol, protocol) != 0))
             continue;
         pk_describe(row);

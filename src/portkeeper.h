@@ -42,12 +42,14 @@ typedef struct {
 
 extern volatile sig_atomic_t pk_interrupted;
 int pk_port(const char *text, unsigned *port);
+int pk_port_range(const char *text, unsigned *first, unsigned *last);
 int pk_pid(const char *text, pid_t *pid);
 int pk_wait_ms(const char *text, int *milliseconds);
 void pk_sanitize(char *text);
 int pk_parse_line(char *line, pk_snapshot *snapshot);
 void pk_snapshot_free(pk_snapshot *snapshot);
-int pk_discover(unsigned port, const char *protocol, enum pk_family family, pk_snapshot *snapshot);
+int pk_discover(unsigned first, unsigned last, const char *protocol,
+                enum pk_family family, pk_snapshot *snapshot);
 int pk_proc_open(pid_t pid);
 int pk_owns_socket(int procfd, int fd, uint64_t inode);
 void pk_describe(pk_row *row);

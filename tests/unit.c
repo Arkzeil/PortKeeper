@@ -116,6 +116,18 @@ int main(void)
                          "80;id", "80/tcp", "9999999999999999999999999999"};
     for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); ++i)
         CHECK(pk_port(bad[i], &port) < 0);
+    unsigned first, last;
+    CHECK(pk_port_range("1-65535", &first, &last) == 0 && first == 1 && last == 65535);
+    CHECK(pk_port_range("3000-3999", &first, &last) == 0 && first == 3000 && last == 3999);
+    CHECK(pk_port_range("00080-00080", &first, &last) == 0 && first == 80 && last == 80);
+    CHECK(pk_port_range("65535-65535", &first, &last) == 0 && first == 65535 && last == 65535);
+    const char *bad_range[] = {"", "80", "80-", "-80", "0-80", "1-0", "81-80",
+                              "1-65536", "65536-65536", "-1-80", "+1-80", "1-+80",
+                              " 1-80", "1-80 ", "1 -80", "1- 80", "1-80\n", "1:80",
+                              "1,80", "1--80", "1-80-90", "1-80;id",
+                              "999999999999999999999-65535", "1-999999999999999999999"};
+    for (size_t i = 0; i < sizeof(bad_range) / sizeof(bad_range[0]); ++i)
+        CHECK(pk_port_range(bad_range[i], &first, &last) < 0);
     pid_t pid;
     CHECK(pk_pid("1", &pid) == 0 && pid == 1);
     CHECK(pk_pid("00123", &pid) == 0 && pid == 123);

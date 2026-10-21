@@ -1,4 +1,4 @@
-# Compatibility validation — 2026-10-21
+# Compatibility validation — 2026-10-22
 
 The expanded suite was run on Ubuntu 24.04, Linux 6.17.0-20-generic, x86-64,
 with Python 3.12.3 and system iproute2 6.1.0.
@@ -10,7 +10,7 @@ with Python 3.12.3 and system iproute2 6.1.0.
 | Clang 18.1.3 | Off | Yes | Pass |
 | Clang 18.1.3 | ASan + UBSan | Yes | Pass |
 
-Each configuration passed the unit executable, 62 integration cases, and three
+Each configuration passed the unit executable, 67 integration cases, and three
 installation checks. One additional integration case, which needs root to
 create a different-UID caller, was explicitly skipped locally.
 ASan leak detection and UBSan halt-on-error
@@ -83,6 +83,23 @@ Initial and later backend failures, malformed results, `/dev/full`, and a closed
 output pipe stop watch with the existing error codes. Visibility warnings stay
 on stderr; JSON snapshot fields and schema version remain unchanged.
 
+## Port-range monitoring
+
+`list --ports FIRST-LAST` was checked with single snapshots and repeated watch
+queries. Unit tests cover inclusive endpoint parsing, identical endpoints,
+leading zeros, the 1-65535 range, malformed/reversed ranges, whitespace, and
+overflow. Five additional integration cases verify CLI validation and rejection
+on inspect/stop, canonical backend arguments, and local range filtering even
+when a fixture backend returns records outside the requested bounds.
+
+Live TCP/UDP and IPv4/IPv6 listeners exercise range boundaries together with
+family, protocol, and verified PID filters. Out-of-range listeners remain alive
+and do not appear in results or produce visibility warnings. Watch checks cover
+closing an in-range listener, rebinding its port, and applying the same range
+arguments on every refresh. Each snapshot uses one backend query for the entire
+range. Existing single-port inspect/stop tests passed with their unchanged
+backend equality filters, and JSON schema version remains 1.
+
 ## PID-selected stops
 
 `stop PORT --pid PID` was checked with shared listeners and separate TCP/UDP
@@ -121,8 +138,8 @@ The corresponding steps were intentionally skipped in sanitizer jobs.
 This confirms the cross-user case in hosted CI, although it remains skipped
 during ordinary unprivileged local test runs.
 
-The manual, installation, family-filter, query-PID, and watch changes were tested
-locally; no hosted run was triggered for those changes. CI now installs
+The manual, installation, family-filter, query-PID, watch, and port-range changes
+were tested locally; no hosted run was triggered for those changes. CI now installs
 groff-base and man-db so manual rendering and discovery are checked alongside
 the compiler matrix.
 

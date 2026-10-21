@@ -10,6 +10,8 @@
   when unavailable owners are omitted.
 - Interval-based list and inspect watch mode, with numbered tables, streaming
   JSON snapshots, refreshed filters, and interruptible waits.
+- Inclusive port-range filtering for list snapshots and watch mode, combined
+  with protocol, family, PID, and JSON options.
 - Confirmed SIGTERM, dry-run, PID-selected stops, and optional exit/socket
   verification with separate timeout and occupied-port results.
 - Socket-inode ownership checks, stable PID descriptors, conservative handling

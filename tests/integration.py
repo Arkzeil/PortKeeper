@@ -386,6 +386,141 @@ class Integration(unittest.TestCase):
         self.assertEqual(watching.returncode, 130, stderr)
         self.assertTrue(all(p.poll() is None for p in (first, other, replacement)))
 
+    def test_port_range_arguments(self):
+        for extra in [("--ports",), ("--ports", "3000-3999", "--ports", "4000-4999"),
+                      ("--ports", "3000-3999", "3000")]:
+            self.assertEqual(self.run_cli("list", *extra, expected=2).stdout, "")
+        for value in ("", "3000", "3000-", "-3999", "3999-3000", "0-3999", "1-65536",
+                      "3000:3999", "3000,3999", "3000--3999", "3000-3999-4999",
+                      "+3000-3999", "3000-+3999", " 3000-3999", "3000 -3999",
+                      "3000- 3999", "3000-3999 ", "3000-3999\n", "3000-3999;id",
+                      "999999999999999999999-65535", "1-999999999999999999999"):
+            result = self.run_cli("list", "--ports", value, "--watch", "1ms", expected=2)
+            self.assertEqual(result.stdout, "")
+        for command in ("inspect", "stop"):
+            for extra in [(), ("--dry-run",) if command == "stop" else ("--watch", "1ms")]:
+                self.run_cli(command, "3000", "--ports", "3000-3999", *extra, expected=2)
+            self.run_cli(command, "--ports", "3000-3999", expected=2)
+
+    def test_port_range_boundaries_and_backend_arguments(self):
+        output = ("tcp LISTEN 0 5 127.0.0.1:2999 0.0.0.0:* ino:1 sk:1\n"
+                  "tcp LISTEN 0 5 127.0.0.1:3000 0.0.0.0:* ino:2 sk:2\n"
+                  "udp UNCONN 0 0 [::1]:3500 [::]:* ino:3 sk:3\n"
+                  "tcp LISTEN 0 5 [::1]:3999 [::]:* ino:4 sk:4\n"
+                  "udp UNCONN 0 0 127.0.0.1:4000 0.0.0.0:* ino:5 sk:5\n"
+                  "tcp LISTEN 0 5 *:1 *:* ino:6 sk:6\n"
+                  "tcp LISTEN 0 5 *:65535 *:* ino:7 sk:7\n")
+        body = ("import json, os, pathlib, sys\n"
+                "with pathlib.Path(os.environ['CALLS']).open('a') as stream:\n"
+                "    stream.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+                f"print({output!r})\n")
+        with self.fake_ss(body) as (env, directory):
+            env['CALLS'] = str(Path(directory, 'calls'))
+            cases = [("3000-3999", [3000, 3500, 3999]), ("03000-03000", [3000]),
+                     ("1-65535", [1, 2999, 3000, 3500, 3999, 4000, 65535]),
+                     ("65535-65535", [65535])]
+            for value, ports in cases:
+                result = self.run_cli('list', '--ports', value, '--json', env=env)
+                self.assertEqual([r['port'] for r in json.loads(result.stdout)['sockets']], ports)
+            calls = [json.loads(line) for line in Path(env['CALLS']).read_text().splitlines()]
+            self.assertEqual(len(calls), len(cases))
+            self.assertEqual(calls[0][-7:], ['sport', '>=', ':3000', 'and', 'sport', '<=', ':3999'])
+            self.assertEqual(calls[1][-3:], ['sport', '=', ':3000'])
+            self.assertEqual(calls[2][-7:], ['sport', '>=', ':1', 'and', 'sport', '<=', ':65535'])
+            self.assertEqual(calls[3][-3:], ['sport', '=', ':65535'])
+            result = self.run_cli('list', '--ports', '3000-3999', '--protocol', 'tcp', env=env)
+            self.assertIn('127.0.0.1:3000', result.stdout)
+            self.assertIn('[::1]:3999', result.stdout)
+            for endpoint in ('127.0.0.1:2999', '[::1]:3500', '127.0.0.1:4000'):
+                self.assertNotIn(endpoint, result.stdout)
+            # A backend ignoring the range cannot introduce an out-of-range visibility warning.
+            result = self.run_cli('list', '--ports', '5000-5999', '--json', env=env)
+            self.assertEqual(json.loads(result.stdout), {'schema_version': 1, 'sockets': []})
+            self.assertEqual(result.stderr, '')
+
+    def test_port_range_is_reapplied_on_watch_refreshes(self):
+        body = ("import json, os, pathlib, sys\n"
+                "counter = pathlib.Path(os.environ['CALLS'])\n"
+                "count = len(counter.read_text().splitlines()) if counter.exists() else 0\n"
+                "with counter.open('a') as stream:\n"
+                "    stream.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+                "if count == 2: sys.exit(1)\n"
+                "print('tcp LISTEN 0 5 127.0.0.1:2999 0.0.0.0:* ino:1 sk:1')\n"
+                "print(f'tcp LISTEN 0 5 127.0.0.1:{3000 if count == 0 else 3999} '"
+                "      '0.0.0.0:* ino:2 sk:2')\n"
+                "print('tcp LISTEN 0 5 127.0.0.1:4000 0.0.0.0:* ino:3 sk:3')\n")
+        with self.fake_ss(body) as (env, directory):
+            env['CALLS'] = str(Path(directory, 'calls'))
+            result = self.run_cli('list', '--ports', '3000-3999', '--watch', '1ms',
+                                  '--family', 'ipv4', '--json', env=env, expected=4)
+            documents = [json.loads(line) for line in result.stdout.splitlines()]
+            self.assertEqual([[r['port'] for r in d['sockets']] for d in documents], [[3000], [3999]])
+            calls = [json.loads(line) for line in Path(env['CALLS']).read_text().splitlines()]
+            self.assertEqual(len(calls), 3)
+            self.assertTrue(all('-4' in args for args in calls))
+            self.assertTrue(all(args[-7:] == ['sport', '>=', ':3000', 'and', 'sport', '<=', ':3999']
+                                for args in calls))
+
+    def range_listeners(self, family='4'):
+        family_number = socket.AF_INET6 if family == '6' else socket.AF_INET
+        address = '::1' if family == '6' else '127.0.0.1'
+        with contextlib.ExitStack() as stack:
+            sockets = [stack.enter_context(socket.socket(family_number, socket.SOCK_STREAM))
+                       for _ in range(4)]
+            for sock in sockets:
+                sock.bind((address, 0))
+                sock.listen(4)
+            # Keep the sockets reserved until each fixture has inherited its own descriptor.
+            return [self.listener(inherited=sock.fileno())
+                    for sock in sorted(sockets, key=lambda s: s.getsockname()[1])]
+
+    @unittest.skipUnless(SS_AVAILABLE, 'iproute2 ss unavailable')
+    def test_port_range_live_queries_and_watch(self):
+        outside_low, lower, upper, outside_high = self.range_listeners()
+        interval = f'{lower[1]}-{upper[1]}'
+        udp, _ = self.listener('udp', port=lower[1])
+        args = ('--ports', interval, '--family', 'ipv4', '--protocol', 'tcp')
+        result = self.run_cli('list', *args, '--json')
+        rows = json.loads(result.stdout)['sockets']
+        pids = {r['pid'] for r in rows}
+        self.assertTrue({lower[0].pid, upper[0].pid} <= pids)
+        self.assertFalse({outside_low[0].pid, outside_high[0].pid, udp.pid} & pids)
+        self.assertTrue(all(lower[1] <= r['port'] <= upper[1] for r in rows))
+        result = self.run_cli('list', *args, '--pid', lower[0].pid, '--json')
+        self.assertEqual([(r['pid'], r['port']) for r in json.loads(result.stdout)['sockets']],
+                         [(lower[0].pid, lower[1])])
+        result = self.run_cli('list', '--ports', interval, '--protocol', 'udp', '--pid', udp.pid,
+                              '--json')
+        self.assertEqual([r['port'] for r in json.loads(result.stdout)['sockets']], [lower[1]])
+        watching = self.start_watch('list', *args, '--watch', '30ms', '--json')
+        rows = self.watch_document(watching)['sockets']
+        self.assertTrue({lower[0].pid, upper[0].pid} <= {r['pid'] for r in rows})
+        lower[0].stdin.write('close\n')
+        lower[0].stdin.flush()
+        self.assertEqual(lower[0].stdout.readline().strip(), 'closed')
+        self.watch_until(watching, lambda rows: lower[0].pid not in {r['pid'] for r in rows})
+        replacement, _ = self.listener(port=lower[1])
+        rows = self.watch_until(watching, lambda rows: replacement.pid in {r['pid'] for r in rows})
+        self.assertTrue(all(lower[1] <= r['port'] <= upper[1] for r in rows))
+        watching.send_signal(signal.SIGINT)
+        _, stderr = watching.communicate(timeout=3)
+        self.assertEqual(watching.returncode, 130, stderr)
+        self.assertTrue(all(p.poll() is None for p in (outside_low[0], upper[0], outside_high[0], udp)))
+
+    @unittest.skipUnless(SS_AVAILABLE, 'iproute2 ss unavailable')
+    def test_port_range_live_ipv6(self):
+        self.require_ipv6()
+        outside_low, lower, upper, outside_high = self.range_listeners(family='6')
+        interval = f'{lower[1]}-{upper[1]}'
+        udp, _ = self.listener('udp', family='6', port=upper[1])
+        for protocol, selected in [('tcp', lower), ('udp', (udp, upper[1]))]:
+            result = self.run_cli('list', '--ports', interval, '--family', 'ipv6',
+                                  '--protocol', protocol, '--pid', selected[0].pid, '--json')
+            rows = json.loads(result.stdout)['sockets']
+            self.assertEqual([(r['pid'], r['port']) for r in rows], [(selected[0].pid, selected[1])])
+            self.assertTrue(all(r['local_address'].startswith('[::1]:') for r in rows))
+        self.assertTrue(all(p.poll() is None for p in (outside_low[0], outside_high[0], udp)))
+
     def test_pid_arguments(self):
         for command in [("list",), ("inspect", "3000"), ("stop", "3000")]:
             for extra in [("--pid",), ("--pid", "123", "--pid", "123")]:

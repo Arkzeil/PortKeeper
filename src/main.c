@@ -11,12 +11,13 @@
 static void usage(FILE *stream)
 {
     fputs("Usage:\n"
-          "  portkeeper list [--protocol tcp|udp] [--family ipv4|ipv6] [--pid PID] [--json] [--watch DURATION]\n"
+          "  portkeeper list [--ports FIRST-LAST] [--protocol tcp|udp] [--family ipv4|ipv6] [--pid PID] [--json] [--watch DURATION]\n"
           "  portkeeper inspect PORT [--protocol tcp|udp] [--family ipv4|ipv6] [--pid PID] [--json] [--watch DURATION]\n"
           "  portkeeper stop PORT [--protocol tcp|udp] [--family ipv4|ipv6] [--pid PID] [--dry-run] [--wait DURATION]\n"
           "  portkeeper --help | --version\n\n"
           "PORT is a decimal number from 1 to 65535. stop sends SIGTERM to\n"
           "all visible owners after you type 'yes'. --dry-run sends no signals.\n"
+          "--ports FIRST-LAST filters list to an inclusive range of ports (1-65535).\n"
           "--family restricts socket family; both IPv4 and IPv6 are included by default.\n"
           "--pid filters verified owners for list/inspect or selects one owner for stop.\n"
           "--json writes a versioned JSON document for list/inspect.\n"
@@ -246,7 +247,7 @@ static int verify_stop_outcome(unsigned port, const char *protocol, enum pk_fami
     if (result != PK_OK && result != PK_TIMEOUT)
         return result;
     pk_snapshot current = {0};
-    int discovered = pk_discover(port, protocol, family, &current);
+    int discovered = pk_discover(port, port, protocol, family, &current);
     if (discovered != PK_OK) {
         fputs("portkeeper: socket state could not be verified; SIGTERM was already sent\n",
               stderr);
@@ -336,7 +337,7 @@ static int stop_port(unsigned port, const char *protocol, enum pk_family family,
         goto done;
     }
     pk_snapshot fresh = {0};
-    result = pk_discover(port, protocol, family, &fresh);
+    result = pk_discover(port, port, protocol, family, &fresh);
     if (result == PK_OK && !same_snapshot(snapshot, &fresh)) {
         fputs("portkeeper: sockets or owners changed during confirmation; "
               "no signals sent, run the command again\n", stderr);
@@ -394,6 +395,7 @@ int main(int argc, char **argv)
     int is_list = strcmp(argv[1], "list") == 0;
     int is_stop = strcmp(argv[1], "stop") == 0;
     unsigned port = 0;
+    unsigned first_port = 0, last_port = 0;
     const char *protocol = NULL;
     enum pk_family family = PK_ANY_FAMILY;
     int dry_run = 0;
@@ -409,6 +411,9 @@ int main(int argc, char **argv)
             else if (strcmp(value, "udp") == 0)
                 protocol = "UDP";
             else
+                goto invalid;
+        } else if (strcmp(argv[i], "--ports") == 0 && is_list && !first_port && i + 1 < argc) {
+            if (pk_port_range(argv[++i], &first_port, &last_port) < 0)
                 goto invalid;
         } else if (strcmp(argv[i], "--family") == 0 && family == PK_ANY_FAMILY && i + 1 < argc) {
             const char *value = argv[++i];
@@ -460,7 +465,8 @@ int main(int argc, char **argv)
     unsigned long long snapshot_number = 0;
     do {
         pk_snapshot snapshot = {0};
-        result = pk_discover(port, protocol, family, &snapshot);
+        result = pk_discover(is_list ? first_port : port, is_list ? last_port : port,
+                             protocol, family, &snapshot);
         if (result == PK_OK && selected_pid && !is_stop) {
             /* Unknown owners cannot be attributed to a PID. Keep the visibility
              * warning even when filtering removes all unavailable rows. */

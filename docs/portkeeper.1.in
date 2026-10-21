@@ -1,8 +1,9 @@
-.TH PORTKEEPER 1 "2026-10-21" "Portkeeper @PROJECT_VERSION@" "User Commands"
+.TH PORTKEEPER 1 "2026-10-22" "Portkeeper @PROJECT_VERSION@" "User Commands"
 .SH NAME
 portkeeper \- inspect local listening ports and stop their owners
 .SH SYNOPSIS
 .B portkeeper list
+.RB [ \-\-ports " FIRST-LAST" ]
 .RB [ \-\-protocol " tcp|udp" ]
 .RB [ \-\-family " ipv4|ipv6" ]
 .RB [ \-\-pid " PID" ]
@@ -63,6 +64,18 @@ sockets on ports not selected by this command.
 .SH OPTIONS
 Options follow the command; their order relative to the port is flexible.
 Repeated options and unsupported command/option combinations are usage errors.
+.TP
+.BI "\-\-ports " FIRST-LAST
+For list only, restrict local ports to this inclusive range.
+FIRST and LAST must be decimal integers from 1 through 65535, with FIRST less
+than or equal to LAST. Equal endpoints select one port; leading zeros are accepted.
+Use one hyphen-separated argument; missing, malformed, reversed, out-of-bounds,
+or repeated ranges are usage errors.
+The option combines with protocol, family, PID, JSON, and watch options.
+Each refresh queries the entire range once, then verifies the bounds locally
+before describing owners or emitting rows. Owners outside the range do not
+produce visibility warnings. An empty filtered list succeeds; watch continues.
+Without this option, list includes all ports.
 .TP
 .BI "\-\-protocol " tcp|udp
 Restrict any command to TCP or UDP sockets.
@@ -134,7 +147,8 @@ before starting another query; discovery and output time add to this interval.
 Use positive whole seconds (1 or 1s) or milliseconds (250ms), up to 3600s.
 Queries run one at a time without catch-up refreshes; each backend query retains
 its own 15-second timeout.
-All filters and inspect details are refreshed for every snapshot.
+All filters, including a list port range, and inspect details are refreshed
+for every snapshot.
 PID filtering follows the current numeric PID, including possible reuse;
 identity is not pinned across refreshes.
 .PP
@@ -291,6 +305,7 @@ a delivery failure takes precedence over verification of its signaled subset.
 .SH EXAMPLES
 .nf
 portkeeper list
+portkeeper list \-\-ports 3000-3999 \-\-watch 1s
 portkeeper list \-\-watch 1s
 portkeeper inspect 8080 \-\-watch 250ms \-\-json
 portkeeper list \-\-family ipv4 \-\-pid 4012 \-\-json
